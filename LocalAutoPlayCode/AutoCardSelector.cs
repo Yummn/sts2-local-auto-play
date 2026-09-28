@@ -15,17 +15,24 @@ internal sealed class AutoCardSelector(CardModel source) : ICardSelector
         IEnumerable<CardModel> options, int minSelect, int maxSelect)
     {
         CardModel[] candidates = options.ToArray();
-        int count = Math.Clamp(Math.Max(minSelect, 1), 0, Math.Min(maxSelect, candidates.Length));
-        if (count == 0)
-            return Task.FromResult<IEnumerable<CardModel>>([]);
+        int limit = Math.Max(0, Math.Min(maxSelect, candidates.Length));
+        if (limit == 0) return Task.FromResult<IEnumerable<CardModel>>([]);
 
         // A hand choice usually discards or exhausts; draw/discard choices
         // usually retrieve or play.  Recycle is the notable hand exception.
         bool hand = candidates.All(card => card.Pile?.Type == PileType.Hand);
         bool recycle = source.Id.Entry.Contains("RECYCLE", StringComparison.OrdinalIgnoreCase);
-        IEnumerable<CardModel> ordered = hand && !recycle
-            ? candidates.OrderBy(LocalPlanner.ChoiceValue)
-            : candidates.OrderByDescending(LocalPlanner.ChoiceValue);
+        Func<CardModel, double> value = recycle
+            ? card => Math.Max(0, card.EnergyCost.GetAmountToSpend())
+            : hand ? card => -LocalPlanner.ChoiceValue(card)
+                   : LocalPlanner.ChoiceValue;
+        CardModel[] ordered = candidates.OrderByDescending(value).ToArray();
+        int required = Math.Min(Math.Max(0, minSelect), limit);
+        int count = required;
+        // Optional selections may be skipped. Do not force a weak card into the
+        // hand or voluntarily discard a valuable one merely because it exists.
+        if (required == 0 && value(ordered[0]) > 0)
+            count = 1;
         CardModel[] selected = ordered.Take(count).ToArray();
         MainFile.Log.Info($"[LocalAutoPlay] CHOICE source={source.Id.Entry} count={count} " +
             $"cards={string.Join(',', selected.Select(c => c.Id.Entry))}");
@@ -38,6 +45,13 @@ internal sealed class AutoCardSelector(CardModel source) : ICardSelector
     {
         CardModel? best = options.Select(option => option.Card)
             .OrderByDescending(LocalPlanner.ChoiceValue).FirstOrDefault();
+        CardRewardAlternative? skip = alternatives.FirstOrDefault(option =>
+            option.OptionId.Equals("Skip", StringComparison.OrdinalIgnoreCase));
+        if (best is null || (skip is not null && LocalPlanner.ChoiceValue(best) <= 0))
+        {
+            MainFile.Log.Info($"[LocalAutoPlay] REWARD_CHOICE source={source.Id.Entry} skip");
+            return new CardRewardSelection { alternative = skip };
+        }
         MainFile.Log.Info($"[LocalAutoPlay] REWARD_CHOICE source={source.Id.Entry} card={best?.Id.Entry ?? "none"}");
         return new CardRewardSelection { card = best };
     }
