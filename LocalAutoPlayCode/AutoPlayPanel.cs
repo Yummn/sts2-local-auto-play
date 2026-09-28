@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Godot;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Commands;
@@ -258,7 +259,12 @@ public partial class AutoPlayPanel : PanelContainer
                 || player.PlayerCombatState?.TurnNumber != turn
                 || state.CurrentSide != CombatSide.Player)
                 return false;
-            if (CanAct(state, player, turn)) return true;
+            // The hand can already be in Play mode while a queued card/orb
+            // action is still resolving. Capturing then records temporarily
+            // unplayable cards and can end the turn with a lethal card in hand.
+            if (CanAct(state, player, turn)
+                && !RunManager.Instance.ActionExecutor.IsRunning)
+                return true;
             SetStatus("等待结算或界面关闭…");
             await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
         }
@@ -287,9 +293,12 @@ public partial class AutoPlayPanel : PanelContainer
         CancellationToken token)
     {
         int failedAttempts = 0;
+        int emptyPlanRetries = 0;
+        int stalePlanRetries = 0;
         for (int i = 0; i < MaxActions; i++)
         {
             if (!await WaitUntilCanAct(state, player, turn, token)) return false;
+            string plannedFrom = CombatSignature(state, player);
             _planning = true;
             SetStatus("正在预测本回合…");
             LocalMove? move;
@@ -303,9 +312,32 @@ public partial class AutoPlayPanel : PanelContainer
             finally { _planning = false; }
             token.ThrowIfCancellationRequested();
             if (!await WaitUntilCanAct(state, player, turn, token)) return false;
+            if (CombatSignature(state, player) != plannedFrom)
+            {
+                if (++stalePlanRetries > 4)
+                {
+                    SetStatus("局面持续变化，已暂停自动出牌");
+                    return false;
+                }
+                i--;
+                MainFile.Log.Info("[LocalAutoPlay] RETRY_PLAN stale combat snapshot");
+                continue;
+            }
 
             if (move is null)
             {
+                if (emptyPlanRetries < 2
+                    && HasPotentiallyTransientCard(player)
+                    && await WaitForHandChange(state, player, turn, token))
+                {
+                    emptyPlanRetries++;
+                    i--; // A wait is not a played card.
+                    MainFile.Log.Info("[LocalAutoPlay] RETRY_PLAN after hand/playability change");
+                    continue;
+                }
+                MainFile.Log.Info($"[LocalAutoPlay] NO_MOVE turn={turn} " +
+                    $"energy={player.PlayerCombatState?.Energy} " +
+                    $"hand={DescribeHand(player)} orbs={HandSignature(player)}");
                 SetStatus($"已打 {i} 张，准备结束回合");
                 return true;
             }
@@ -320,6 +352,8 @@ public partial class AutoPlayPanel : PanelContainer
             }
             finally { _playingAction = false; }
             failedAttempts = 0;
+            emptyPlanRetries = 0;
+            stalePlanRetries = 0;
             MainFile.Log.Info($"[LocalAutoPlay] PLAY turn={turn} index={i + 1} " +
                 $"card={move.Value.Card.Id.Entry} score={move.Value.Score:0.0}");
             if (_stopAfterCurrent) { SetStatus("已停止"); return false; }
@@ -327,6 +361,83 @@ public partial class AutoPlayPanel : PanelContainer
         }
         SetStatus("已达单回合出牌上限，准备结束回合");
         return true;
+    }
+
+    private static bool HasPotentiallyTransientCard(Player player)
+    {
+        foreach (CardModel card in player.PlayerCombatState?.Hand.Cards ?? [])
+        {
+            try
+            {
+                if (card.CanPlay(out UnplayableReason reason, out _)) continue;
+                if ((reason & (UnplayableReason.BlockedByHook
+                    | UnplayableReason.BlockedByCardLogic)) != 0
+                    && (reason & (UnplayableReason.HasUnplayableKeyword
+                        | UnplayableReason.EnergyCostTooHigh
+                        | UnplayableReason.StarCostTooHigh)) == 0)
+                    return true;
+            }
+            catch { /* A card mid-transition is a reason to wait, not end. */
+                return true; }
+        }
+        return false;
+    }
+
+    private async Task<bool> WaitForHandChange(CombatState state, Player player,
+        int turn, CancellationToken token)
+    {
+        string initial = HandSignature(player);
+        if (!HasPotentiallyTransientCard(player)) return true;
+        SetStatus("等待卡牌结算…");
+        for (int frame = 0; frame < 36 && IsInsideTree(); frame++)
+        {
+            token.ThrowIfCancellationRequested();
+            await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+            if (!CombatManager.Instance.IsInProgress
+                || !ReferenceEquals(CombatManager.Instance.DebugOnlyGetState(), state)
+                || player.PlayerCombatState?.TurnNumber != turn
+                || state.CurrentSide != CombatSide.Player)
+                return false;
+            if (!RunManager.Instance.ActionExecutor.IsRunning
+                && (HandSignature(player) != initial
+                    || !HasPotentiallyTransientCard(player)))
+                return true;
+        }
+        return false;
+    }
+
+    private static string HandSignature(Player player)
+    {
+        PlayerCombatState? pcs = player.PlayerCombatState;
+        if (pcs is null) return "no-hand";
+        string cards = string.Join(',', pcs.Hand.Cards.Select(card =>
+        {
+            bool playable;
+            try { playable = card.CanPlay(); }
+            catch { playable = false; }
+            return $"{RuntimeHelpers.GetHashCode(card)}/{playable}";
+        }));
+        string orbs = string.Join(',', pcs.OrbQueue.Orbs.Select(orb =>
+            $"{orb.GetType().Name}/{orb.EvokeVal}"));
+        return $"{pcs.Energy}:{cards}:{orbs}";
+    }
+
+    private static string CombatSignature(CombatState state, Player player) =>
+        HandSignature(player) + ":" + string.Join(',', state.HittableEnemies.Select(e =>
+            $"{RuntimeHelpers.GetHashCode(e)}/{e.CurrentHp}/{e.Block}"));
+
+    private static string DescribeHand(Player player)
+    {
+        return string.Join(',', player.PlayerCombatState?.Hand.Cards.Select(card =>
+        {
+            try
+            {
+                bool playable = card.CanPlay(out UnplayableReason reason, out _);
+                return $"{card.Id.Entry}/{card.EnergyCost.GetAmountToSpend()}/" +
+                    (playable ? "ready" : reason.ToString());
+            }
+            catch (Exception ex) { return $"{card.Id.Entry}/{ex.GetType().Name}"; }
+        }) ?? []);
     }
 
     private static bool CanAct(CombatState state, Player player, int turn)

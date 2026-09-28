@@ -16,7 +16,7 @@ public static class MainFile
     public static void Initialize()
     {
         new Harmony("LocalAutoPlay").PatchAll();
-        Log.Info("[LocalAutoPlay] v0.5.1 loaded; audited card effects, turn-end search, no potions.");
+        Log.Info("[LocalAutoPlay] v0.5.2 loaded; action-queue stability and charged-orb forecast, no potions.");
     }
 }
 
