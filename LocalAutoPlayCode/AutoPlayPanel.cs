@@ -423,8 +423,16 @@ public partial class AutoPlayPanel : PanelContainer
     }
 
     private static string CombatSignature(CombatState state, Player player) =>
-        HandSignature(player) + ":" + string.Join(',', state.HittableEnemies.Select(e =>
-            $"{RuntimeHelpers.GetHashCode(e)}/{e.CurrentHp}/{e.Block}"));
+        HandSignature(player) + ":" + PowerSignature(player.Creature) + ":" +
+        string.Join(',', player.Relics.Select(r =>
+            $"{r.Id}/{r.DisplayAmount}")) + ":" +
+        string.Join(',', state.HittableEnemies.Select(e =>
+            $"{RuntimeHelpers.GetHashCode(e)}/{e.CurrentHp}/{e.Block}/" +
+            PowerSignature(e)));
+
+    private static string PowerSignature(Creature creature) =>
+        string.Join(',', creature.Powers.Select(p => $"{p.Id}/{p.Amount}")
+            .OrderBy(s => s, StringComparer.Ordinal));
 
     private static string DescribeHand(Player player)
     {
