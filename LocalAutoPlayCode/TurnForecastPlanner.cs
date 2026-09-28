@@ -25,9 +25,14 @@ namespace LocalAutoPlay;
 internal static class TurnForecastPlanner
 {
     private const int MaxDepth = 48;
+    private const int ForecastTurns = 3;
+    private const int FutureTurnDepth = 12;
+    private const int CurrentSearchMs = 350;
+    private const int TotalSearchMs = 950;
     private const int BeamWidth = 72;
     private const int MaxNodes = 30000;
-    private const int MaxSearchMs = 450;
+    private const int FutureBeamWidth = 18;
+    private const int FutureExpansions = 240;
     private static readonly Lazy<MethodInfo?> ReworkCheckMethod = new(() =>
         AppDomain.CurrentDomain.GetAssemblies()
             .FirstOrDefault(a => a.GetName().Name == "BetterDefect")?
@@ -55,7 +60,10 @@ internal static class TurnForecastPlanner
         int DexterityGain = 0, int BufferGain = 0, int Hits = 1,
         SimEnchant? Enchant = null, int CostWithoutFreePower = 0,
         bool VirtualReplay = false, bool CapturedFreePower = false,
-        int CostAfterPlay = 0);
+        int CostAfterPlay = 0, int CostAfterTurn = 0,
+        int CostAfterPlayedTurn = 0,
+        bool Retain = false, bool Ethereal = false,
+        bool PermanentRetain = false);
 
     private sealed record SimEnchant(string Kind, int Amount, bool Active,
         int ExtraReplays);
@@ -90,7 +98,8 @@ internal static class TurnForecastPlanner
         SimOrb[] Orbs, int OrbCapacity, int Focus, int TempFocus, int FeralUses,
         int Heatsinks, int Loop, bool FeralAllCards = false,
         BattleFactors? Factors = null, int SeriesPlayed = 0,
-        Rng? CostRng = null);
+        Rng? CostRng = null, int MaxEnergy = 3, int HandDraw = 5,
+        int FeralMax = 0, bool ReworkedLoop = false);
 
     private sealed record Node(
         SimCard[] Hand, SimCard[] Draw, int DrawCursor, SimCard[] Discard,
@@ -100,10 +109,14 @@ internal static class TurnForecastPlanner
         int Heatsinks, int Loop, double OtherPowerValue,
         int Depth, LocalMove? First, string Forecast,
         bool FeralAllCards = false, BattleFactors? Factors = null,
-        int SeriesPlayed = 0, Rng? CostRng = null);
+        int SeriesPlayed = 0, Rng? CostRng = null,
+        int TurnIndex = 0, double PlayerHp = 0,
+        int[]? ProjectedIncoming = null, int FeralMax = 0,
+        string FutureFirst = "");
 
     private readonly record struct SearchResult(LocalMove? Move, int Nodes, int Depth,
         bool Exhaustive, string Forecast);
+    private readonly record struct FutureResult(double Score, string Forecast);
 
     public static async Task<LocalMove?> ChooseAsync(
         CombatState combat, Player player, CancellationToken token)
@@ -171,7 +184,10 @@ internal static class TurnForecastPlanner
             CombatManager.Instance.History.CardPlaysStarted.Count(entry =>
                 entry.Actor == player.Creature && entry.CardPlay.IsFirstInSeries &&
                 entry.HappenedThisTurn(combat)),
-            Fork(player.RunState.Rng.CombatEnergyCosts));
+            Fork(player.RunState.Rng.CombatEnergyCosts),
+            Math.Max(0, pcs.MaxEnergy), 5,
+            player.Creature.Powers.Where(p => p.GetType().Name == "FeralPower")
+                .Sum(p => p.Amount), IsReworkedLoop());
     }
 
     private static BattleFactors CaptureFactors(Player player, Creature[] enemies)
@@ -322,7 +338,12 @@ internal static class TurnForecastPlanner
                     CardType.Power => "FreePowerPower",
                     _ => ""
                 })),
-            CostAfterPlay: CostAfterPlaying(card));
+            CostAfterPlay: CostAfterPlaying(card),
+            CostAfterTurn: CostAfterTurn(card),
+            CostAfterPlayedTurn: CostAfterPlayedTurn(card),
+            Retain: card.ShouldRetainThisTurn,
+            Ethereal: card.Keywords.Contains(CardKeyword.Ethereal),
+            PermanentRetain: card.Keywords.Contains(CardKeyword.Retain));
     }
 
     private static int CostAfterPlaying(CardModel card)
@@ -338,6 +359,39 @@ internal static class TurnForecastPlanner
         return Math.Max(0, cost);
     }
 
+    private static int CostAfterTurn(CardModel card)
+    {
+        if (card.EnergyCost.CostsX) return 0;
+        int cost = card.EnergyCost.GetWithModifiers(CostModifiers.None);
+        if (LocalCostModifiersField?.GetValue(card.EnergyCost)
+            is not IEnumerable<LocalCostModifier> modifiers)
+            return Math.Max(0, card.EnergyCost.GetWithModifiers(CostModifiers.Local));
+        foreach (LocalCostModifier modifier in modifiers)
+            if (!modifier.Expiration.HasFlag(LocalCostModifierExpiration.EndOfTurn))
+                cost = modifier.Modify(cost);
+        return Math.Max(0, cost);
+    }
+
+    private static int CostAfterPlayedTurn(CardModel card)
+    {
+        if (card.EnergyCost.CostsX) return 0;
+        int cost = card.EnergyCost.GetWithModifiers(CostModifiers.None);
+        if (LocalCostModifiersField?.GetValue(card.EnergyCost)
+            is not IEnumerable<LocalCostModifier> modifiers)
+            return Math.Max(0, card.EnergyCost.GetWithModifiers(CostModifiers.Local));
+        foreach (LocalCostModifier modifier in modifiers)
+            if (!modifier.Expiration.HasFlag(LocalCostModifierExpiration.WhenPlayed) &&
+                !modifier.Expiration.HasFlag(LocalCostModifierExpiration.EndOfTurn))
+                cost = modifier.Modify(cost);
+        return Math.Max(0, cost);
+    }
+
+    private static bool IsReworkedLoop()
+    {
+        try { return IsBetterDefectRework(ModelDb.Card<Loop>()); }
+        catch { return false; }
+    }
+
     private static SearchResult Search(Snapshot snapshot, CancellationToken token)
     {
         List<Node> frontier = [new Node(snapshot.Hand, snapshot.Draw, 0,
@@ -348,7 +402,8 @@ internal static class TurnForecastPlanner
             snapshot.Heatsinks, snapshot.Loop,
             0, 0, null, "", snapshot.FeralAllCards,
             snapshot.Factors ?? BattleFactors.Empty(snapshot.EnemyHp.Length),
-            snapshot.SeriesPlayed, snapshot.CostRng)];
+            snapshot.SeriesPlayed, snapshot.CostRng,
+            PlayerHp: snapshot.PlayerHp, FeralMax: snapshot.FeralMax)];
         Node best = frontier[0]; // Ending the turn is always a legal candidate.
         double bestScore = EvaluateEnd(best, snapshot);
         Stopwatch watch = Stopwatch.StartNew();
@@ -356,6 +411,20 @@ internal static class TurnForecastPlanner
         int deepest = 0;
         bool cutoff = false;
         Dictionary<string, double> visited = new(StringComparer.Ordinal);
+        Dictionary<string, List<Node>> boundary = new(StringComparer.Ordinal);
+        void KeepBoundary(Node candidate)
+        {
+            string id = candidate.First is { } move
+                ? $"{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Card)}/" +
+                  $"{(move.Target is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Target))}"
+                : "end-now";
+            if (!boundary.TryGetValue(id, out List<Node>? choices))
+                boundary[id] = choices = new List<Node>(2);
+            choices.Add(candidate);
+            choices.Sort((a, b) => EvaluateEnd(b, snapshot).CompareTo(EvaluateEnd(a, snapshot)));
+            if (choices.Count > 2) choices.RemoveAt(2);
+        }
+        KeepBoundary(best);
         for (int depth = 0; depth < MaxDepth && frontier.Count > 0; depth++)
         {
             List<Node> next = new();
@@ -367,12 +436,13 @@ internal static class TurnForecastPlanner
                     if (card.Type is CardType.Status or CardType.Curse) continue;
                     int cost = EffectiveCost(card, node);
                     if (cost > node.Energy) continue;
-                    foreach ((int targetIndex, Creature? target) in Targets(card, node.EnemyHp, depth))
+                    foreach ((int targetIndex, Creature? target) in Targets(card,
+                        node.EnemyHp, node.TurnIndex == 0 && node.Depth == 0))
                     {
                         if ((expanded & 63) == 0)
                         {
                             token.ThrowIfCancellationRequested();
-                            if (expanded >= MaxNodes || watch.ElapsedMilliseconds >= MaxSearchMs)
+                            if (expanded >= MaxNodes || watch.ElapsedMilliseconds >= CurrentSearchMs)
                             { cutoff = true; break; }
                         }
                         Node? child = Apply(node, card, handIndex, targetIndex, target,
@@ -381,6 +451,7 @@ internal static class TurnForecastPlanner
                         expanded++;
                         deepest = Math.Max(deepest, child.Depth);
                         double terminal = EvaluateEnd(child, snapshot);
+                        KeepBoundary(child);
                         if (terminal > bestScore + 0.001)
                         {
                             best = child;
@@ -405,17 +476,264 @@ internal static class TurnForecastPlanner
             if (next.Count > BeamWidth) cutoff = true;
             frontier = next.OrderByDescending(n => BeamScore(n, snapshot))
                 .Take(BeamWidth).ToList();
-            if (cutoff && (expanded >= MaxNodes || watch.ElapsedMilliseconds >= MaxSearchMs)) break;
+            if (cutoff && (expanded >= MaxNodes || watch.ElapsedMilliseconds >= CurrentSearchMs)) break;
         }
         if (deepest >= MaxDepth) cutoff = true;
+        string bestTrace = best.Forecast;
+        if (bestScore < 10000)
+        {
+            double bestForecast = double.NegativeInfinity;
+            foreach (Node candidate in boundary.Values.SelectMany(c => c)
+                .DistinctBy(StateKey)
+                .OrderByDescending(c => EvaluateEnd(c, snapshot)).Take(18))
+            {
+                if (watch.ElapsedMilliseconds >= TotalSearchMs) { cutoff = true; break; }
+                FutureResult forecast = ForecastThreeTurns(candidate, snapshot, watch, token);
+                if (forecast.Score <= bestForecast + 0.001) continue;
+                best = candidate;
+                bestForecast = forecast.Score;
+                bestScore = forecast.Score;
+                bestTrace = forecast.Forecast;
+            }
+        }
         return new SearchResult(best.First is { } first ? first with { Score = bestScore } : null,
-            expanded, deepest, !cutoff, best.Forecast);
+            expanded, deepest, !cutoff, bestTrace);
+    }
+
+    private static FutureResult ForecastThreeTurns(Node firstTurn, Snapshot snapshot,
+        Stopwatch watch, CancellationToken token)
+    {
+        double firstScore = EvaluateEnd(firstTurn, snapshot);
+        if (firstScore >= 10000 || firstScore <= -10000)
+            return new FutureResult(firstScore, firstTurn.Forecast);
+        Node? secondStart = AdvanceTurn(firstTurn, snapshot);
+        if (secondStart is null)
+            return new FutureResult(firstScore, firstTurn.Forecast);
+        double best = double.NegativeInfinity;
+        string bestTrace = firstTurn.Forecast;
+        foreach (Node second in SearchFutureTurn(secondStart, snapshot, watch, token))
+        {
+            double secondScore = EvaluateEnd(second, snapshot);
+            if (secondScore >= 10000 || secondScore <= -10000)
+            {
+                double value = 0.4 * firstScore + 0.6 * secondScore;
+                if (value > best) { best = value; bestTrace = second.Forecast; }
+                continue;
+            }
+            Node? thirdStart = AdvanceTurn(second, snapshot);
+            if (thirdStart is null)
+            {
+                double value = 0.4 * firstScore + 0.6 * secondScore;
+                if (value > best) { best = value; bestTrace = second.Forecast; }
+                continue;
+            }
+            Node third = SearchFutureTurn(thirdStart, snapshot, watch, token)
+                .OrderByDescending(n => EvaluateEnd(n, snapshot)).First();
+            double thirdScore = EvaluateEnd(third, snapshot);
+            double total = 0.25 * firstScore + 0.3 * secondScore +
+                0.45 * thirdScore;
+            if (total > best) { best = total; bestTrace = third.Forecast; }
+            if (watch.ElapsedMilliseconds >= TotalSearchMs) break;
+        }
+        return double.IsNegativeInfinity(best)
+            ? new FutureResult(firstScore, firstTurn.Forecast)
+            : new FutureResult(best, bestTrace);
+    }
+
+    private static IReadOnlyList<Node> SearchFutureTurn(Node start, Snapshot snapshot,
+        Stopwatch watch, CancellationToken token)
+    {
+        List<Node> candidates = [start];
+        List<Node> frontier = [start];
+        Dictionary<string, double> visited = new(StringComparer.Ordinal);
+        int expanded = 0;
+        for (int depth = 0; depth < FutureTurnDepth && frontier.Count > 0 &&
+            expanded < FutureExpansions && watch.ElapsedMilliseconds < TotalSearchMs; depth++)
+        {
+            List<Node> next = new();
+            foreach (Node node in frontier)
+            {
+                foreach (int handIndex in Enumerable.Range(0, node.Hand.Length))
+                {
+                    SimCard card = node.Hand[handIndex];
+                    if (card.Type is CardType.Status or CardType.Curse ||
+                        EffectiveCost(card, node) > node.Energy) continue;
+                    foreach ((int targetIndex, Creature? target) in
+                        Targets(card, node.EnemyHp, firstAction: false))
+                    {
+                        if ((expanded & 31) == 0)
+                        {
+                            token.ThrowIfCancellationRequested();
+                            if (watch.ElapsedMilliseconds >= TotalSearchMs) break;
+                        }
+                        Node? child = Apply(node, card, handIndex, targetIndex,
+                            target, snapshot);
+                        if (child is null) continue;
+                        expanded++;
+                        candidates.Add(child);
+                        if (child.EnemyHp.Any(h => h > 0))
+                        {
+                            string key = StateKey(child);
+                            double score = BeamScore(child, snapshot);
+                            if (!visited.TryGetValue(key, out double old) ||
+                                score > old + 0.001)
+                            {
+                                visited[key] = score;
+                                next.Add(child);
+                            }
+                        }
+                        if (expanded >= FutureExpansions) break;
+                    }
+                    if (expanded >= FutureExpansions ||
+                        watch.ElapsedMilliseconds >= TotalSearchMs) break;
+                }
+                if (expanded >= FutureExpansions ||
+                    watch.ElapsedMilliseconds >= TotalSearchMs) break;
+            }
+            frontier = next.OrderByDescending(n => BeamScore(n, snapshot))
+                .Take(FutureBeamWidth).ToList();
+        }
+        Node[] distinct = candidates.DistinctBy(StateKey).ToArray();
+        Node[] options = distinct
+            .Where(n => n.FutureFirst.Length > 0)
+            .GroupBy(n => n.FutureFirst, StringComparer.Ordinal)
+            .Select(group => group.OrderByDescending(n => EvaluateEnd(n, snapshot)).First())
+            .OrderByDescending(n => EvaluateEnd(n, snapshot)).Take(3).ToArray();
+        return [start, .. options];
+    }
+
+    private static Node? AdvanceTurn(Node node, Snapshot snapshot)
+    {
+        if (node.TurnIndex >= ForecastTurns - 1) return null;
+        double[] hp = (double[])node.EnemyHp.Clone();
+        double block = node.Block;
+        int energy = node.Energy;
+        List<SimOrb> orbs = node.Orbs.ToList();
+        BattleFactors factors = node.Factors is { } live
+            ? live with { Enemies = (EnemyFactors[])live.Enemies.Clone() }
+            : BattleFactors.Empty(hp.Length);
+        for (int i = 0; i < orbs.Count; i++)
+            if (orbs[i].Kind != "PlasmaOrb")
+                TriggerPassive(orbs, i, hp, ref block, ref energy, factors);
+        if (hp.All(h => h <= 0)) return null;
+
+        int[] incoming = node.ProjectedIncoming ?? snapshot.Incoming;
+        BattleFactors initial = snapshot.Factors ?? BattleFactors.Empty(hp.Length);
+        double attackTotal = 0;
+        double largestAttack = 0;
+        for (int i = 0; i < hp.Length; i++)
+        {
+            if (hp[i] <= 0) continue;
+            double attack = incoming[i];
+            if (factors.Enemies[i].Weak > 0 && initial.Enemies[i].Weak == 0)
+                attack *= 0.75;
+            attackTotal += attack;
+            largestAttack = Math.Max(largestAttack, attack);
+        }
+        double loss = Math.Max(0, attackTotal + factors.SelfDamage - block);
+        if (factors.PlayerIntangible > 0)
+            loss = Math.Min(loss, Math.Max(1, hp.Count(h => h > 0) * 2));
+        int bufferUsed = factors.PlayerBuffer > 0 && loss > 0 ? 1 : 0;
+        if (bufferUsed > 0) loss = Math.Max(0, loss - largestAttack);
+        double remainingHp = (node.PlayerHp > 0 ? node.PlayerHp : snapshot.PlayerHp) - loss;
+        if (remainingHp <= 0) return null;
+
+        // Clear enemy block when their next turn starts; status durations and
+        // enemy actions beyond the visible intent remain approximate.
+        for (int i = 0; i < hp.Length; i++)
+        {
+            EnemyFactors enemy = factors.Enemies[i];
+            hp[i] = Math.Max(0, hp[i] - enemy.Block);
+            factors.Enemies[i] = enemy with
+            {
+                Block = 0,
+                Weak = Math.Max(0, enemy.Weak - 1),
+                Vulnerable = Math.Max(0, enemy.Vulnerable - 1),
+                Intangible = Math.Max(0, enemy.Intangible - 1)
+            };
+        }
+        factors = factors with
+        {
+            Strength = factors.Strength - factors.TemporaryStrength,
+            Dexterity = factors.Dexterity - factors.TemporaryDexterity,
+            TemporaryStrength = 0,
+            TemporaryDexterity = 0,
+            PlayerBuffer = Math.Max(0, factors.PlayerBuffer - bufferUsed),
+            PlayerIntangible = Math.Max(0, factors.PlayerIntangible - 1),
+            Burst = 0,
+            VigorConsumed = false,
+            SelfDamage = 0
+        };
+        if (node.TempFocus != 0)
+            for (int i = 0; i < orbs.Count; i++)
+            {
+                SimOrb orb = orbs[i];
+                orbs[i] = orb with
+                {
+                    Passive = Math.Max(0, orb.Passive - node.TempFocus),
+                    Evoke = orb.Kind is "DarkOrb" or "PlasmaOrb" ? orb.Evoke
+                        : Math.Max(0, orb.Evoke -
+                            (orb.Kind == "GlassOrb" ? 2 : 1) * node.TempFocus)
+                };
+            }
+
+        SimCard Cleanup(SimCard card) => card with
+        {
+            Cost = card.CostAfterTurn,
+            CostWithoutFreePower = card.CostAfterTurn,
+            CapturedFreePower = false,
+            GeneratedFree = false,
+            Retain = card.PermanentRetain
+        };
+        List<SimCard> discard = node.Discard.Select(Cleanup).ToList();
+        List<SimCard> hand = new();
+        foreach (SimCard card in node.Hand)
+        {
+            if (card.Ethereal) continue;
+            SimCard cleaned = Cleanup(card);
+            if (card.Retain) hand.Add(cleaned);
+            else discard.Add(cleaned);
+        }
+        SimCard[] draw = node.Draw.Select(Cleanup).ToArray();
+        int cursor = node.DrawCursor;
+        Rng shuffle = node.ShuffleRng;
+        Rng costRng = node.CostRng ?? snapshot.CostRng ?? Fork(node.ShuffleRng);
+        string forecast = node.Forecast.Length < 2048
+            ? node.Forecast + $" turn:{node.TurnIndex + 2}" : node.Forecast;
+        DrawCards(snapshot.HandDraw, hand, ref draw, ref cursor, discard,
+            ref shuffle, ref costRng, ref forecast);
+        energy = snapshot.MaxEnergy;
+        block = 0;
+        for (int repeat = 0; repeat < node.Loop && orbs.Count > 0; repeat++)
+        {
+            TriggerPassive(orbs, 0, hp, ref block, ref energy, factors);
+            if (snapshot.ReworkedLoop)
+                TriggerPassive(orbs, orbs.Count - 1, hp, ref block, ref energy, factors);
+        }
+        foreach (SimOrb orb in orbs)
+            if (orb.Kind == "PlasmaOrb") energy += (int)orb.Passive;
+        // Unknown future intents: use a capped risk estimate derived from the
+        // currently visible attack, never pretend to know the monster's AI/RNG.
+        int[] nextIncoming = snapshot.Incoming.Select((value, i) => hp[i] <= 0
+            ? 0 : Math.Clamp((int)Math.Round(value * 0.55 + 4), 4, 35)).ToArray();
+        return node with
+        {
+            Hand = hand.ToArray(), Draw = draw, DrawCursor = cursor,
+            Discard = discard.ToArray(), ShuffleRng = shuffle, CostRng = costRng,
+            Energy = energy, CardsPlayedThisTurn = 0,
+            SeriesPlayed = 0, Block = block, EnemyHp = hp,
+            Orbs = orbs.ToArray(), Focus = node.Focus - node.TempFocus,
+            TempFocus = 0, FeralUses = node.FeralMax,
+            Factors = factors, PlayerHp = remainingHp,
+            TurnIndex = node.TurnIndex + 1, ProjectedIncoming = nextIncoming,
+            Forecast = forecast, FutureFirst = ""
+        };
     }
 
     private static IEnumerable<(int Index, Creature? Target)> Targets(
-        SimCard card, double[] hp, int depth)
+        SimCard card, double[] hp, bool firstAction)
     {
-        if (depth == 0) return card.RootTargets;
+        if (firstAction) return card.RootTargets;
         if (card.TargetType == TargetType.AnyEnemy)
             return Enumerable.Range(0, hp.Length).Where(i => hp[i] > 0).Select(i => (i, (Creature?)null));
         if (card.TargetType == TargetType.AnyAlly) return [];
@@ -522,7 +840,7 @@ internal static class TurnForecastPlanner
             EnemyFactors enemy = factors.Enemies[targetIndex];
             bool appliesWeak = card.WeakApply > 0 &&
                 (card.Kind != "GoForTheEyes" || card.Reworked ||
-                    snapshot.Incoming[targetIndex] > 0);
+                    (node.ProjectedIncoming ?? snapshot.Incoming)[targetIndex] > 0);
             if (appliesWeak)
             {
                 if (enemy.Artifact > 0) enemy = enemy with { Artifact = enemy.Artifact - 1 };
@@ -967,6 +1285,7 @@ internal static class TurnForecastPlanner
         {
             Cost = card.CostAfterPlay,
             CostWithoutFreePower = card.CostAfterPlay,
+            CostAfterTurn = card.CostAfterPlayedTurn,
             CapturedFreePower = false,
             GeneratedFree = false
         };
@@ -1014,20 +1333,26 @@ internal static class TurnForecastPlanner
                 {
                     Cost = Math.Max(0, playedCard.Cost - 1),
                     CostAfterPlay = Math.Max(0, playedCard.CostAfterPlay - 1),
-                    CostWithoutFreePower = Math.Max(0, playedCard.CostWithoutFreePower - 1)
+                    CostWithoutFreePower = Math.Max(0, playedCard.CostWithoutFreePower - 1),
+                    CostAfterTurn = Math.Max(0, playedCard.CostAfterTurn - 1),
+                    CostAfterPlayedTurn = Math.Max(0, playedCard.CostAfterPlayedTurn - 1)
                 }
                 : playedCard);
 
-        LocalMove firstMove = node.First
-            ?? new LocalMove(card.Model, target, 0,
-                selection.Count > 0 ? selection.ToArray() : null);
+        LocalMove? firstMove = node.First ?? (node.TurnIndex == 0
+            ? new LocalMove(card.Model, target, 0,
+                selection.Count > 0 ? selection.ToArray() : null) : null);
         Node resolved = new Node(hand.ToArray(), draw, drawCursor, discard.ToArray(),
             shuffleRng, generationRng, orbRng,
             Math.Clamp(energy, 0, 99), node.CardsPlayedThisTurn + 1,
             block, hp, orbs.ToArray(), capacity, focus, tempFocus,
             feral, heatsinks, loop, otherPower, node.Depth + 1, firstMove,
             forecast, feralAllCards, factors,
-            node.SeriesPlayed + (card.VirtualReplay ? 0 : 1), costRng);
+            node.SeriesPlayed + (card.VirtualReplay ? 0 : 1), costRng,
+            node.TurnIndex, node.PlayerHp, node.ProjectedIncoming,
+            node.FeralMax + (card.Kind == "Feral" ? Math.Max(1, card.Amount) : 0),
+            node.FutureFirst.Length > 0 || node.TurnIndex == 0
+                ? node.FutureFirst : card.Id);
         if (replays == 0) return resolved;
         SimCard replay = playedCard with
         {
@@ -1111,6 +1436,8 @@ internal static class TurnForecastPlanner
                     Cost = rolled,
                     CostWithoutFreePower = rolled,
                     CostAfterPlay = rolled,
+                    CostAfterTurn = rolled,
+                    CostAfterPlayedTurn = rolled,
                     CapturedFreePower = false
                 };
                 if (forecast.Length < 2048) forecast += $" slither:{next.Id}/{rolled}";
@@ -1278,20 +1605,22 @@ internal static class TurnForecastPlanner
             : BattleFactors.Empty(hp.Length);
         // Orb passives occur as the player turn ends, before the enemy attacks.
         for (int i = 0; i < orbs.Count; i++)
-            TriggerPassive(orbs, i, hp, ref block, ref unusedEnergy, factors);
+            if (orbs[i].Kind != "PlasmaOrb")
+                TriggerPassive(orbs, i, hp, ref block, ref unusedEnergy, factors);
         double dealt = 0;
+        BattleFactors initial = snapshot.Factors ?? BattleFactors.Empty(hp.Length);
         for (int i = 0; i < hp.Length; i++)
-            dealt += Math.Max(0, snapshot.EnemyHp[i] - hp[i]);
+            dealt += Math.Max(0, snapshot.EnemyHp[i] -
+                (node.TurnIndex > 0 ? initial.Enemies[i].Block : 0) - hp[i]);
         if (hp.All(h => h <= 0))
             return 10000 + dealt - node.Depth * 0.15;
 
         double incoming = 0;
         double largestAttack = 0;
-        BattleFactors initial = snapshot.Factors ?? BattleFactors.Empty(hp.Length);
         for (int i = 0; i < hp.Length; i++)
         {
             if (hp[i] <= 0) continue;
-            double attack = snapshot.Incoming[i];
+            double attack = (node.ProjectedIncoming ?? snapshot.Incoming)[i];
             if (factors.Enemies[i].Weak > 0 && initial.Enemies[i].Weak == 0)
                 attack *= 0.75; // Existing Weak is already in the live intent.
             incoming += attack;
@@ -1303,8 +1632,10 @@ internal static class TurnForecastPlanner
             loss = Math.Min(loss, Math.Max(1, hp.Count(h => h > 0) * 2));
         if (factors.PlayerBuffer > 0)
             loss = Math.Max(0, loss - largestAttack * Math.Min(factors.PlayerBuffer, 1));
-        if (loss >= snapshot.PlayerHp)
-            return -10000 + dealt - loss * 10;
+        double playerHp = node.PlayerHp > 0 ? node.PlayerHp : snapshot.PlayerHp;
+        double totalLoss = snapshot.PlayerHp - playerHp + loss;
+        if (loss >= playerHp)
+            return -10000 + dealt - totalLoss * 10;
 
         double future = node.OtherPowerValue
             + Math.Min(6, node.Heatsinks * 3)
@@ -1336,7 +1667,7 @@ internal static class TurnForecastPlanner
                 if (factors.Enemies[i].Weak > initial.Enemies[i].Weak) future += 2;
                 if (factors.Enemies[i].Vulnerable > initial.Enemies[i].Vulnerable) future += 2;
             }
-        return dealt - loss * 12 + future + Math.Min(30, block - incoming) * 0.01
+        return dealt - totalLoss * 12 + future + Math.Min(30, block - incoming) * 0.01
             - node.Depth * 0.15;
     }
 
@@ -1357,7 +1688,7 @@ internal static class TurnForecastPlanner
     {
         // Looping zero-cost cards may recreate the same position. Dominance
         // prefers the first (shorter) route, which also prevents frame spikes.
-        return $"{node.Energy}:{node.Block:0.0}:{node.DrawCursor}:" +
+        return $"{node.TurnIndex}:{node.PlayerHp:0.0}:{node.Energy}:{node.Block:0.0}:{node.DrawCursor}:" +
             $"{node.CardsPlayedThisTurn}:{node.SeriesPlayed}:{node.OrbCapacity}:{node.OtherPowerValue:0.0}:" +
             $"{string.Join(',', node.EnemyHp.Select(h => Math.Round(h)))}:" +
             $"{string.Join(',', node.Hand.Select(c =>
@@ -1365,7 +1696,7 @@ internal static class TurnForecastPlanner
             $"{string.Join(',', node.Draw.Skip(node.DrawCursor).Select(c => CardKey(c, c.Cost)))}:" +
             $"{string.Join(',', node.Discard.Select(c => CardKey(c, c.Cost)).OrderBy(s => s))}:" +
             $"{string.Join(',', node.Orbs.Select(o => $"{o.Kind}/{o.Passive:0}/{o.Evoke:0}"))}:" +
-            $"{node.FeralUses}:{node.FeralAllCards}:{node.Heatsinks}:{node.Loop}:{node.Focus}:{node.TempFocus}:" +
+            $"{node.FeralUses}:{node.FeralMax}:{node.FeralAllCards}:{node.Heatsinks}:{node.Loop}:{node.Focus}:{node.TempFocus}:" +
             (node.Factors is { } f
                 ? $"{f.Strength}/{f.Dexterity}/{f.PlayerBuffer}/{f.PenNib}/{f.Nunchaku}/" +
                   $"{f.Shuriken}/{f.Kunai}/{f.OrnamentalFan}/{f.LetterOpener}/{f.VigorConsumed}/" +
@@ -1377,7 +1708,8 @@ internal static class TurnForecastPlanner
     }
 
     private static string CardKey(SimCard card, int cost) =>
-        $"{card.Id}/{cost}/{card.CostAfterPlay}/" +
+        $"{card.Id}/{cost}/{card.CostAfterPlay}/{card.CostAfterTurn}/" +
+        $"{card.CostAfterPlayedTurn}/{card.Retain}/{card.PermanentRetain}/{card.Ethereal}/" +
         $"{card.Enchant?.Kind}/{card.Enchant?.Amount}/{card.Enchant?.Active}/" +
         $"{card.Enchant?.ExtraReplays}";
     private static (SimCard[], Rng) PredictGenerated(
