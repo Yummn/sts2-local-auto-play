@@ -11,26 +11,12 @@ namespace LocalAutoPlay;
 internal readonly record struct LocalMove(CardModel Card, Creature? Target, double Score);
 
 /// <summary>
-/// A bounded, deliberately conservative one-step heuristic.  Never executes card
-/// effects in a preview: all values below are read-only estimates, and the game
-/// re-checks legality immediately before the real action is enqueued.
+/// A bounded one-step heuristic.  Never executes card effects in a preview:
+/// all values below are read-only estimates, and the game checks legality again
+/// immediately before the real action is enqueued.
 /// </summary>
 internal static class LocalPlanner
 {
-    // Choice cards and opaque mod effects are NOT inferred from card text.  This
-    // whitelist is intentionally narrow until they have live play/choice tests.
-    private static readonly HashSet<string> Supported = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "StrikeDefect", "StrikeIronclad", "StrikeSilent", "StrikeNecrobinder", "StrikeRegent",
-        "DefendDefect", "DefendIronclad", "DefendSilent", "DefendNecrobinder", "DefendRegent",
-        "Zap", "Dualcast", "BallLightning", "ColdSnap", "BeamCell", "GoForTheEyes",
-        "Leap", "ChargeBattery", "Glacier", "SweepingBeam", "SteamBarrier",
-        "Claw", "Streamline", "Sunder", "Melter", "Barrage", "Hyperbeam",
-        "Defragment", "Loop", "Storm", "Electrodynamics", "Buffer", "Capacitor",
-        "StaticDischarge", "Coolheaded", "Ftl", "Turbo", "DoubleEnergy",
-        "BdSteamBarrier", "BdStreamline", "BdBullseye", "BdAutoShields"
-    };
-
     public static LocalMove? Choose(CombatState state, Player player)
     {
         var pcs = player.PlayerCombatState;
@@ -45,10 +31,6 @@ internal static class LocalPlanner
 
         foreach (CardModel card in pcs.Hand.Cards.ToArray())
         {
-            if (!Supported.Contains(card.GetType().Name)
-                || card.TargetType == TargetType.AnyAlly
-                || card.EnergyCost.CostsX)
-                continue;
             try
             {
                 if (!card.CanPlay())
@@ -57,6 +39,11 @@ internal static class LocalPlanner
                 {
                     foreach (Creature enemy in enemies)
                         Consider(card, enemy);
+                }
+                else if (card.TargetType == TargetType.AnyAlly)
+                {
+                    foreach (Creature ally in state.Allies.Where(a => a.IsAlive))
+                        Consider(card, ally);
                 }
                 else if (card.CanPlayTargeting(null))
                     Consider(card, null);
@@ -73,7 +60,7 @@ internal static class LocalPlanner
             if (!card.CanPlayTargeting(target))
                 return;
             double score = Score(card, target, enemies, pcs, blockMissing, incoming);
-            if (score <= 0.05 || (best.HasValue && score <= best.Value.Score))
+            if (score <= 0 || (best.HasValue && score <= best.Value.Score))
                 return;
             best = new LocalMove(card, target, score);
         }
@@ -101,6 +88,8 @@ internal static class LocalPlanner
         PlayerCombatState pcs, decimal blockMissing, int incoming)
     {
         int cost = Math.Max(0, card.EnergyCost.GetAmountToSpend());
+        if (card.EnergyCost.CostsX)
+            cost = Math.Max(0, pcs.Energy);
         double damage = Math.Max(Amount(card, "Damage"), Amount(card, "OstyDamage"));
         double repeat = Math.Clamp(Amount(card, "Repeat"), 1, 8);
         double block = Amount(card, "Block");
@@ -108,7 +97,10 @@ internal static class LocalPlanner
         double energy = Amount(card, "Energy");
         string name = card.GetType().Name;
 
-        double score = 0;
+        // Every game-playable card remains a candidate, including status/curse,
+        // custom cards, and X-cost cards.  Unknown effects receive a small
+        // positive fallback instead of being silently excluded.
+        double score = card.Type is CardType.Status or CardType.Curse ? 0.25 : 1.0;
         if (card.Type == CardType.Attack)
         {
             // Attack text is not simulated; dynamic damage is only an estimate.
@@ -135,26 +127,32 @@ internal static class LocalPlanner
             score += Math.Min(energy, 4) * 5;
         if (card.Type == CardType.Power)
             score += 9;
+        if (card.EnergyCost.CostsX && pcs.Energy > 0)
+            score += Math.Min(pcs.Energy, 6) * 2.0;
         if (name is "Zap" or "BallLightning" or "ColdSnap" or "Glacier")
             score += 5;
         if (name is "Dualcast" or "Barrage")
             score += 5;
-        if (name is "DefendDefect" or "DefendIronclad" or "DefendSilent"
-            or "DefendRegent" or "DefendNecrobinder" or "Leap" or "SteamBarrier"
-            or "BdSteamBarrier" or "BdAutoShields")
-        {
-            // Block with no incoming damage is usually wasted; keep only extra
-            // known utility (e.g. Auto Shields creates an orb).
-            if (incoming <= 0 && name != "BdAutoShields")
-                return 0;
-        }
+        if (block > 0 && incoming <= 0)
+            score -= Math.Min(block, 15) * 0.15;
         // Pure setup cards are useful before damage, but not when this fight is
         // effectively over or when the hand has nothing to spend their energy on.
         if (name is "Ftl" or "Coolheaded" or "SweepingBeam")
             score += 2;
-        if (score <= 0)
-            return 0;
-        return score - cost * 1.8 + (cost == 0 ? 1.5 : 0);
+        // A negative approximate score is not a legality ruling: still allow
+        // the card after more useful plays have been exhausted.
+        return Math.Max(0.1, score - cost * 0.75 + (cost == 0 ? 1.5 : 0));
+    }
+
+    internal static double ChoiceValue(CardModel card)
+    {
+        double damage = Math.Max(Amount(card, "Damage"), Amount(card, "OstyDamage"));
+        double block = Amount(card, "Block");
+        double draw = Amount(card, "Cards");
+        double energy = Amount(card, "Energy");
+        double cost = card.EnergyCost.CostsX ? 2 : Math.Max(0, card.EnergyCost.GetAmountToSpend());
+        return damage + block * 0.65 + draw * 3 + energy * 4
+            + (card.Type == CardType.Power ? 7 : 0) - cost * 1.5;
     }
 
     private static double Amount(CardModel card, string key)

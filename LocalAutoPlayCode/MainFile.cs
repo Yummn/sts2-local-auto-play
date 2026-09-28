@@ -16,7 +16,7 @@ public static class MainFile
     public static void Initialize()
     {
         new Harmony("LocalAutoPlay").PatchAll();
-        Log.Info("[LocalAutoPlay] v0.1.0 loaded; manual, single-turn mode.");
+        Log.Info("[LocalAutoPlay] v0.2.0 loaded; all playable cards, native card choices, no potions.");
     }
 }
 

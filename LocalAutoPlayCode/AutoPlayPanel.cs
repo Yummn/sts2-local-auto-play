@@ -1,5 +1,6 @@
 using Godot;
 using MegaCrit.Sts2.Core.Combat;
+using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Context;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Players;
@@ -20,6 +21,7 @@ public partial class AutoPlayPanel : PanelContainer
     private Label? _status;
     private CancellationTokenSource? _stop;
     private bool _running;
+    private bool _stopAfterCurrent;
 
     public static void Attach(NCombatUi ui)
     {
@@ -103,11 +105,12 @@ public partial class AutoPlayPanel : PanelContainer
     {
         if (_running)
         {
-            _stop?.Cancel();
-            SetStatus("正在停止…");
+            _stopAfterCurrent = true;
+            SetStatus("当前牌结算后停止…");
             return;
         }
         _running = true;
+        _stopAfterCurrent = false;
         _stop = new CancellationTokenSource();
         _button!.Text = "■ 停止出牌";
         try { await PlayTurn(_stop.Token); }
@@ -154,6 +157,11 @@ public partial class AutoPlayPanel : PanelContainer
             SetStatus($"出牌 {i + 1}/{MaxActions}");
             await PlayOne(move.Value, token);
             MainFile.Log.Info($"[LocalAutoPlay] PLAY turn={turn} index={i + 1} card={move.Value.Card.Id.Entry} score={move.Value.Score:0.0}");
+            if (_stopAfterCurrent)
+            {
+                SetStatus("已停止");
+                return;
+            }
             await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
         }
         SetStatus("已达单次出牌上限");
@@ -176,6 +184,8 @@ public partial class AutoPlayPanel : PanelContainer
 
     private static async Task PlayOne(LocalMove move, CancellationToken token)
     {
+        if (CardSelectCmd.Selector is not null)
+            throw new InvalidOperationException("Another card selector is already active.");
         var source = new TaskCompletionSource<GameAction>(TaskCreationOptions.RunContinuationsAsynchronously);
         var executor = RunManager.Instance.ActionExecutor;
         void Capture(GameAction action)
@@ -187,6 +197,7 @@ public partial class AutoPlayPanel : PanelContainer
         executor.BeforeActionExecuted += Capture;
         try
         {
+            using IDisposable selector = CardSelectCmd.PushSelector(new AutoCardSelector(move.Card));
             if (!move.Card.TryManualPlay(move.Target))
                 throw new InvalidOperationException($"{move.Card.Id.Entry} became unplayable.");
             GameAction action = await source.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
@@ -199,7 +210,7 @@ public partial class AutoPlayPanel : PanelContainer
     {
         if (GodotObject.IsInstanceValid(_status))
             _status!.Text = value;
-        if (value != "正在停止…" && !value.StartsWith("出牌 ", StringComparison.Ordinal))
+        if (!value.StartsWith("出牌 ", StringComparison.Ordinal))
             MainFile.Log.Info($"[LocalAutoPlay] STOP status={value}");
     }
 }
