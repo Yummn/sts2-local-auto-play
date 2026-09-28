@@ -3,7 +3,7 @@
   "name": "局部自动出牌",
   "author": "Codex",
   "description": "单人战斗中点击按钮，以有限深度规划当前回合出牌顺序；自动处理原生选牌。不自动结束回合，默认不用药水。无需 BaseLib。",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "min_game_version": "0.107.1",
   "has_pck": false,
   "has_dll": true,

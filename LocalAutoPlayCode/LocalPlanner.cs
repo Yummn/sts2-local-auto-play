@@ -19,6 +19,7 @@ internal static class LocalPlanner
 {
     private const int Depth = 3;
     private const int BeamWidth = 8;
+    private const int MaxFutureCandidates = 24;
     private const int MaxExpansions = 640;
     private const int MaxMilliseconds = 7;
     private const double FutureDiscount = 0.88;
@@ -68,6 +69,11 @@ internal static class LocalPlanner
             }
         }
         if (candidates.Count == 0) return null;
+        Candidate[] futureCandidates = candidates
+            .OrderByDescending(c => c.Damage + c.Block + c.Draw * 4 + c.EnergyGain * 4
+                + (c.IsPower ? 9 : 0) + (c.IsOrbCard ? 4 : 0)
+                + (c.IsDoubleEnergy ? 8 : 0))
+            .Take(MaxFutureCandidates).ToArray();
 
         PlanState initial = new(0, Math.Max(0, pcs.Energy), hand.Length,
             pcs.DrawPile.Cards.Count + pcs.DiscardPile.Cards.Count,
@@ -82,7 +88,8 @@ internal static class LocalPlanner
             List<PlanState> next = new();
             foreach (PlanState node in frontier)
             {
-                foreach (Candidate candidate in candidates)
+                IEnumerable<Candidate> options = depth == 0 ? candidates : futureCandidates;
+                foreach (Candidate candidate in options)
                 {
                     // Root candidates are always evaluated. Later levels are
                     // bounded to avoid frame spikes on large modded hands.
