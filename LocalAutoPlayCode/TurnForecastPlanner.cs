@@ -42,6 +42,10 @@ internal static class TurnForecastPlanner
     private static readonly FieldInfo? LocalCostModifiersField =
         typeof(CardEnergyCost).GetField("_localModifiers",
             BindingFlags.Instance | BindingFlags.NonPublic);
+    private static readonly PropertyInfo? RngCounterProperty =
+        typeof(Rng).GetProperty("Counter", BindingFlags.Instance | BindingFlags.Public);
+    private static readonly FieldInfo? RngCounterField =
+        typeof(Rng).GetField("_counter", BindingFlags.Instance | BindingFlags.NonPublic);
 
     private enum Generator { None, Discovery, WhiteNoise, InfernalBlade, Distraction, JackOfAllTrades, BundleOfJoy, Abundance }
     private enum Pool { CharacterAll, CharacterPower, CharacterAttack, CharacterSkill, Colorless }
@@ -99,7 +103,8 @@ internal static class TurnForecastPlanner
         int Heatsinks, int Loop, bool FeralAllCards = false,
         BattleFactors? Factors = null, int SeriesPlayed = 0,
         Rng? CostRng = null, int MaxEnergy = 3, int HandDraw = 5,
-        int FeralMax = 0, bool ReworkedLoop = false);
+        int FeralMax = 0, bool ReworkedLoop = false,
+        Rng? TargetRng = null);
 
     private sealed record Node(
         SimCard[] Hand, SimCard[] Draw, int DrawCursor, SimCard[] Discard,
@@ -112,7 +117,7 @@ internal static class TurnForecastPlanner
         int SeriesPlayed = 0, Rng? CostRng = null,
         int TurnIndex = 0, double PlayerHp = 0,
         int[]? ProjectedIncoming = null, int FeralMax = 0,
-        string FutureFirst = "");
+        string FutureFirst = "", Rng? TargetRng = null);
 
     private readonly record struct SearchResult(LocalMove? Move, int Nodes, int Depth,
         bool Exhaustive, string Forecast);
@@ -187,7 +192,8 @@ internal static class TurnForecastPlanner
             Fork(player.RunState.Rng.CombatEnergyCosts),
             Math.Max(0, pcs.MaxEnergy), 5,
             player.Creature.Powers.Where(p => p.GetType().Name == "FeralPower")
-                .Sum(p => p.Amount), IsReworkedLoop());
+                .Sum(p => p.Amount), IsReworkedLoop(),
+            Fork(player.RunState.Rng.CombatTargets));
     }
 
     private static BattleFactors CaptureFactors(Player player, Creature[] enemies)
@@ -262,7 +268,9 @@ internal static class TurnForecastPlanner
             "Abundance" => Generator.Abundance,
             _ => Generator.None
         };
-        bool orb = name is "Zap" or "BallLightning" or "ColdSnap" or "Glacier"
+        bool orb = name is "Zap" or "BallLightning" or "ColdSnap" or "Coolheaded"
+            or "Glacier" or "BdElectrodynamics" or "BdDoomAndGloom"
+            or "ConsumingShadow" or "BdRecursion"
             or "Dualcast" or "Barrage" or "MultiCast" or "Recursion"
             or "Chaos" or "Rainbow" or "Tempest" or "Fusion"
             or "MeteorStrike" or "Darkness" or "Chill" or "Glasswork"
@@ -403,7 +411,8 @@ internal static class TurnForecastPlanner
             0, 0, null, "", snapshot.FeralAllCards,
             snapshot.Factors ?? BattleFactors.Empty(snapshot.EnemyHp.Length),
             snapshot.SeriesPlayed, snapshot.CostRng,
-            PlayerHp: snapshot.PlayerHp, FeralMax: snapshot.FeralMax)];
+            PlayerHp: snapshot.PlayerHp, FeralMax: snapshot.FeralMax,
+            TargetRng: snapshot.TargetRng)];
         Node best = frontier[0]; // Ending the turn is always a legal candidate.
         double bestScore = EvaluateEnd(best, snapshot);
         Stopwatch watch = Stopwatch.StartNew();
@@ -411,20 +420,21 @@ internal static class TurnForecastPlanner
         int deepest = 0;
         bool cutoff = false;
         Dictionary<string, double> visited = new(StringComparer.Ordinal);
-        Dictionary<string, List<Node>> boundary = new(StringComparer.Ordinal);
-        void KeepBoundary(Node candidate)
+        Dictionary<string, List<(Node Node, double Score)>> boundary =
+            new(StringComparer.Ordinal);
+        void KeepBoundary(Node candidate, double score)
         {
             string id = candidate.First is { } move
                 ? $"{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Card)}/" +
                   $"{(move.Target is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Target))}"
                 : "end-now";
-            if (!boundary.TryGetValue(id, out List<Node>? choices))
-                boundary[id] = choices = new List<Node>(2);
-            choices.Add(candidate);
-            choices.Sort((a, b) => EvaluateEnd(b, snapshot).CompareTo(EvaluateEnd(a, snapshot)));
+            if (!boundary.TryGetValue(id, out List<(Node Node, double Score)>? choices))
+                boundary[id] = choices = new List<(Node Node, double Score)>(2);
+            choices.Add((candidate, score));
+            choices.Sort((a, b) => b.Score.CompareTo(a.Score));
             if (choices.Count > 2) choices.RemoveAt(2);
         }
-        KeepBoundary(best);
+        KeepBoundary(best, bestScore);
         for (int depth = 0; depth < MaxDepth && frontier.Count > 0; depth++)
         {
             List<Node> next = new();
@@ -451,7 +461,7 @@ internal static class TurnForecastPlanner
                         expanded++;
                         deepest = Math.Max(deepest, child.Depth);
                         double terminal = EvaluateEnd(child, snapshot);
-                        KeepBoundary(child);
+                        KeepBoundary(child, terminal);
                         if (terminal > bestScore + 0.001)
                         {
                             best = child;
@@ -484,8 +494,8 @@ internal static class TurnForecastPlanner
         {
             double bestForecast = double.NegativeInfinity;
             foreach (Node candidate in boundary.Values.SelectMany(c => c)
-                .DistinctBy(StateKey)
-                .OrderByDescending(c => EvaluateEnd(c, snapshot)).Take(18))
+                .OrderByDescending(c => c.Score)
+                .Select(c => c.Node).DistinctBy(StateKey).Take(18))
             {
                 if (watch.ElapsedMilliseconds >= TotalSearchMs) { cutoff = true; break; }
                 FutureResult forecast = ForecastThreeTurns(candidate, snapshot, watch, token);
@@ -608,13 +618,16 @@ internal static class TurnForecastPlanner
         double[] hp = (double[])node.EnemyHp.Clone();
         double block = node.Block;
         int energy = node.Energy;
+        Rng inheritedTargets = node.TargetRng ?? snapshot.TargetRng ?? node.ShuffleRng;
+        Rng targetRng = node.Orbs.Any(orb => orb.Kind == "LightningOrb")
+            ? Fork(inheritedTargets) : inheritedTargets;
         List<SimOrb> orbs = node.Orbs.ToList();
         BattleFactors factors = node.Factors is { } live
             ? live with { Enemies = (EnemyFactors[])live.Enemies.Clone() }
             : BattleFactors.Empty(hp.Length);
         for (int i = 0; i < orbs.Count; i++)
             if (orbs[i].Kind != "PlasmaOrb")
-                TriggerPassive(orbs, i, hp, ref block, ref energy, factors);
+                TriggerPassive(orbs, i, hp, ref block, ref energy, factors, targetRng);
         if (hp.All(h => h <= 0)) return null;
 
         int[] incoming = node.ProjectedIncoming ?? snapshot.Incoming;
@@ -706,9 +719,9 @@ internal static class TurnForecastPlanner
         block = 0;
         for (int repeat = 0; repeat < node.Loop && orbs.Count > 0; repeat++)
         {
-            TriggerPassive(orbs, 0, hp, ref block, ref energy, factors);
+            TriggerPassive(orbs, 0, hp, ref block, ref energy, factors, targetRng);
             if (snapshot.ReworkedLoop)
-                TriggerPassive(orbs, orbs.Count - 1, hp, ref block, ref energy, factors);
+                TriggerPassive(orbs, orbs.Count - 1, hp, ref block, ref energy, factors, targetRng);
         }
         foreach (SimOrb orb in orbs)
             if (orb.Kind == "PlasmaOrb") energy += (int)orb.Passive;
@@ -726,7 +739,7 @@ internal static class TurnForecastPlanner
             TempFocus = 0, FeralUses = node.FeralMax,
             Factors = factors, PlayerHp = remainingHp,
             TurnIndex = node.TurnIndex + 1, ProjectedIncoming = nextIncoming,
-            Forecast = forecast, FutureFirst = ""
+            Forecast = forecast, FutureFirst = "", TargetRng = targetRng
         };
     }
 
@@ -807,6 +820,9 @@ internal static class TurnForecastPlanner
         Rng generationRng = node.GenerationRng;
         Rng orbRng = node.OrbRng;
         Rng costRng = node.CostRng ?? snapshot.CostRng ?? Fork(node.ShuffleRng);
+        Rng inheritedTargets = node.TargetRng ?? snapshot.TargetRng ?? node.ShuffleRng;
+        Rng targetRng = card.OrbCard || UsesOrbEffects(card.Kind)
+            ? Fork(inheritedTargets) : inheritedTargets;
         string forecast = node.Forecast.Length < 2048
             ? node.Forecast + $" play:{card.Id}" : node.Forecast;
         List<CardModel> selection = new();
@@ -893,7 +909,7 @@ internal static class TurnForecastPlanner
         {
             case "Barrage" when card.Reworked:
                 for (int i = 0; i < orbs.Count; i++)
-                    TriggerPassive(orbs, i, hp, ref block, ref energy, factors);
+                    TriggerPassive(orbs, i, hp, ref block, ref energy, factors, targetRng);
                 break;
             case "BallLightning":
             case "Zap":
@@ -901,53 +917,53 @@ internal static class TurnForecastPlanner
                 for (int i = 0; i < (card.Kind == "BdElectrodynamics"
                     ? Math.Max(1, card.Amount) : 1); i++)
                     Channel(orbs, ref capacity, "LightningOrb", focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 break;
             case "ColdSnap":
                 for (int i = 0; i < (card.Reworked ? 2 : 1); i++)
                     Channel(orbs, ref capacity, "FrostOrb", focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 break;
             case "Coolheaded":
                 Channel(orbs, ref capacity, "FrostOrb", focus, hp,
-                    ref block, ref energy, factors);
+                    ref block, ref energy, factors, targetRng);
                 break;
             case "Glacier":
                 for (int i = 0; i < 2; i++)
                     Channel(orbs, ref capacity, "FrostOrb", focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 break;
             case "Chill":
                 int chillCount = hp.Count(h => h > 0);
                 for (int i = 0; i < chillCount; i++)
                     Channel(orbs, ref capacity, "FrostOrb", focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 break;
             case "Fusion":
                 Channel(orbs, ref capacity, "PlasmaOrb", focus, hp,
-                    ref block, ref energy, factors);
+                    ref block, ref energy, factors, targetRng);
                 break;
             case "MeteorStrike":
                 for (int i = 0; i < (card.Reworked ? 2 : 3); i++)
                     Channel(orbs, ref capacity, "PlasmaOrb", focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 break;
             case "Glasswork":
                 Channel(orbs, ref capacity, "GlassOrb", focus, hp,
-                    ref block, ref energy, factors);
+                    ref block, ref energy, factors, targetRng);
                 break;
             case "Darkness":
                 Channel(orbs, ref capacity, "DarkOrb", focus, hp,
-                    ref block, ref energy, factors);
+                    ref block, ref energy, factors, targetRng);
                 for (int i = 0; i < orbs.Count; i++)
                     if (orbs[i].Kind == "DarkOrb")
                         for (int n = 0; n < (card.Upgrade > 0 ? 2 : 1); n++)
-                            TriggerPassive(orbs, i, hp, ref block, ref energy, factors);
+                            TriggerPassive(orbs, i, hp, ref block, ref energy, factors, targetRng);
                 break;
             case "BdDoomAndGloom":
             case "ConsumingShadow":
                 Channel(orbs, ref capacity, "DarkOrb", focus, hp,
-                    ref block, ref energy, factors);
+                    ref block, ref energy, factors, targetRng);
                 break;
             case "Chaos":
                 for (int i = 0; i < (card.Reworked ? 2
@@ -973,7 +989,7 @@ internal static class TurnForecastPlanner
                     };
                     orbRng = rng;
                     Channel(orbs, ref capacity, kind, focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 }
                 break;
             case "Rainbow":
@@ -982,7 +998,7 @@ internal static class TurnForecastPlanner
                         "DarkOrb", "PlasmaOrb" }
                     : new[] { "LightningOrb", "FrostOrb", "DarkOrb" })
                     Channel(orbs, ref capacity, kind, focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 break;
             case "Tempest":
                 int tempestDraw = 0;
@@ -992,7 +1008,7 @@ internal static class TurnForecastPlanner
                         && orbs.Count > 0 && orbs[0].Kind == "LightningOrb")
                         tempestDraw++;
                     Channel(orbs, ref capacity, "LightningOrb", focus, hp,
-                        ref block, ref energy, factors);
+                        ref block, ref energy, factors, targetRng);
                 }
                 if (tempestDraw > 0)
                     DrawCards(tempestDraw, hand, ref draw, ref drawCursor, discard,
@@ -1005,8 +1021,8 @@ internal static class TurnForecastPlanner
             case "Dualcast":
                 if (orbs.Count > 0)
                 {
-                    Evoke(orbs[0], hp, ref block, ref energy, factors);
-                    Evoke(orbs[0], hp, ref block, ref energy, factors);
+                    Evoke(orbs[0], hp, ref block, ref energy, factors, targetRng);
+                    Evoke(orbs[0], hp, ref block, ref energy, factors, targetRng);
                     orbs.RemoveAt(0);
                 }
                 break;
@@ -1015,15 +1031,15 @@ internal static class TurnForecastPlanner
                 {
                     SimOrb first = orbs[0];
                     for (int i = 0; i < Math.Max(1, card.Amount); i++)
-                        Evoke(first, hp, ref block, ref energy, factors);
+                        Evoke(first, hp, ref block, ref energy, factors, targetRng);
                     orbs.RemoveAt(0);
                 }
                 break;
             case "Shatter":
                 while (orbs.Count > 0)
                 {
-                    Evoke(orbs[0], hp, ref block, ref energy, factors);
-                    Evoke(orbs[0], hp, ref block, ref energy, factors);
+                    Evoke(orbs[0], hp, ref block, ref energy, factors, targetRng);
+                    Evoke(orbs[0], hp, ref block, ref energy, factors, targetRng);
                     orbs.RemoveAt(0);
                 }
                 break;
@@ -1032,15 +1048,15 @@ internal static class TurnForecastPlanner
                     && orbs.Count > 0; i++)
                 {
                     SimOrb first = orbs[0];
-                    Evoke(first, hp, ref block, ref energy, factors);
-                    if (card.Reworked) Evoke(first, hp, ref block, ref energy, factors);
+                    Evoke(first, hp, ref block, ref energy, factors, targetRng);
+                    if (card.Reworked) Evoke(first, hp, ref block, ref energy, factors, targetRng);
                     orbs.RemoveAt(0);
                     if (card.Reworked)
                     {
                         // The rework restores the same type; a dark orb keeps
                         // the charge of the evoked orb.
                         Channel(orbs, ref capacity, first.Kind, focus, hp,
-                            ref block, ref energy, factors, first.Kind == "DarkOrb"
+                            ref block, ref energy, factors, targetRng, first.Kind == "DarkOrb"
                                 ? first.Evoke : null);
                     }
                 }
@@ -1050,12 +1066,12 @@ internal static class TurnForecastPlanner
                 {
                     int index = card.Reworked ? orbs.Count - 1 : 0;
                     SimOrb selectedOrb = orbs[index];
-                    Evoke(selectedOrb, hp, ref block, ref energy, factors);
+                    Evoke(selectedOrb, hp, ref block, ref energy, factors, targetRng);
                     if (card.Reworked)
-                        Evoke(selectedOrb, hp, ref block, ref energy, factors);
+                        Evoke(selectedOrb, hp, ref block, ref energy, factors, targetRng);
                     orbs.RemoveAt(index);
                     Channel(orbs, ref capacity, selectedOrb.Kind, focus, hp,
-                        ref block, ref energy, factors, selectedOrb.Kind == "DarkOrb"
+                        ref block, ref energy, factors, targetRng, selectedOrb.Kind == "DarkOrb"
                             ? selectedOrb.Evoke : null);
                 }
                 break;
@@ -1352,7 +1368,7 @@ internal static class TurnForecastPlanner
             node.TurnIndex, node.PlayerHp, node.ProjectedIncoming,
             node.FeralMax + (card.Kind == "Feral" ? Math.Max(1, card.Amount) : 0),
             node.FutureFirst.Length > 0 || node.TurnIndex == 0
-                ? node.FutureFirst : card.Id);
+                ? node.FutureFirst : card.Id, targetRng);
         if (replays == 0) return resolved;
         SimCard replay = playedCard with
         {
@@ -1478,23 +1494,25 @@ internal static class TurnForecastPlanner
 
     private static void Channel(List<SimOrb> orbs, ref int capacity, string kind,
         int focus, double[] hp, ref double block, ref int energy,
-        BattleFactors factors, double? darkCharge = null)
+        BattleFactors factors, Rng targetRng, double? darkCharge = null)
     {
         if (capacity <= 0) capacity = 1;
         if (orbs.Count >= capacity)
         {
-            Evoke(orbs[0], hp, ref block, ref energy, factors);
+            Evoke(orbs[0], hp, ref block, ref energy, factors, targetRng);
             orbs.RemoveAt(0);
         }
         orbs.Add(NewOrb(kind, focus, darkCharge));
     }
 
     private static void Evoke(SimOrb orb, double[] hp,
-        ref double block, ref int energy, BattleFactors factors)
+        ref double block, ref int energy, BattleFactors factors, Rng targetRng)
     {
         switch (orb.Kind)
         {
             case "LightningOrb":
+                Hit(hp, RandomEnemy(hp, targetRng), orb.Evoke, factors);
+                break;
             case "DarkOrb":
                 Hit(hp, Weakest(hp), orb.Evoke, factors);
                 break;
@@ -1507,12 +1525,15 @@ internal static class TurnForecastPlanner
     }
 
     private static void TriggerPassive(List<SimOrb> orbs, int index,
-        double[] hp, ref double block, ref int energy, BattleFactors factors)
+        double[] hp, ref double block, ref int energy, BattleFactors factors,
+        Rng targetRng)
     {
         SimOrb orb = orbs[index];
         switch (orb.Kind)
         {
-            case "LightningOrb": Hit(hp, Weakest(hp), orb.Passive, factors); break;
+            case "LightningOrb":
+                Hit(hp, RandomEnemy(hp, targetRng), orb.Passive, factors);
+                break;
             case "FrostOrb": block += orb.Passive; break;
             case "DarkOrb":
                 orbs[index] = orb with { Evoke = orb.Evoke + orb.Passive };
@@ -1536,6 +1557,24 @@ internal static class TurnForecastPlanner
             if (hp[i] > 0 && (best < 0 || hp[i] < hp[best])) best = i;
         return best;
     }
+
+    private static int RandomEnemy(double[] hp, Rng rng)
+    {
+        int alive = hp.Count(value => value > 0);
+        if (alive == 0) return -1;
+        int choice = rng.NextInt(0, alive);
+        for (int i = 0; i < hp.Length; i++)
+            if (hp[i] > 0 && choice-- == 0) return i;
+        return -1;
+    }
+
+    private static bool UsesOrbEffects(string kind) => kind is
+        "Barrage" or "BallLightning" or "Zap" or "BdElectrodynamics"
+        or "ColdSnap" or "Coolheaded" or "Glacier" or "Chill"
+        or "Fusion" or "MeteorStrike" or "Glasswork" or "Darkness"
+        or "BdDoomAndGloom" or "ConsumingShadow" or "Chaos" or "Rainbow"
+        or "Tempest" or "Dualcast" or "Quadcast" or "Shatter"
+        or "MultiCast" or "BdRecursion";
 
     private static BattleFactors HitAttack(double[] hp, int index,
         double totalDamage, int hits, BattleFactors factors, BattleFactors initial)
@@ -1599,6 +1638,9 @@ internal static class TurnForecastPlanner
         double[] hp = (double[])node.EnemyHp.Clone();
         double block = node.Block;
         int unusedEnergy = node.Energy;
+        Rng inheritedTargets = node.TargetRng ?? snapshot.TargetRng ?? node.ShuffleRng;
+        Rng targetRng = node.Orbs.Any(orb => orb.Kind == "LightningOrb")
+            ? Fork(inheritedTargets) : inheritedTargets;
         List<SimOrb> orbs = node.Orbs.ToList();
         BattleFactors factors = node.Factors is { } live
             ? live with { Enemies = (EnemyFactors[])live.Enemies.Clone() }
@@ -1606,7 +1648,7 @@ internal static class TurnForecastPlanner
         // Orb passives occur as the player turn ends, before the enemy attacks.
         for (int i = 0; i < orbs.Count; i++)
             if (orbs[i].Kind != "PlasmaOrb")
-                TriggerPassive(orbs, i, hp, ref block, ref unusedEnergy, factors);
+                TriggerPassive(orbs, i, hp, ref block, ref unusedEnergy, factors, targetRng);
         double dealt = 0;
         BattleFactors initial = snapshot.Factors ?? BattleFactors.Empty(hp.Length);
         for (int i = 0; i < hp.Length; i++)
@@ -1640,21 +1682,8 @@ internal static class TurnForecastPlanner
         double future = node.OtherPowerValue
             + Math.Min(6, node.Heatsinks * 3)
             + Math.Min(5, node.FeralUses * 2)
-            + Math.Min(8, node.Loop * (orbs.Count > 0 ? 3 : 1));
-        foreach (SimOrb orb in orbs)
-        {
-            double nextPassive = orb.Kind == "PlasmaOrb" ? orb.Passive
-                : Math.Max(0, orb.Passive - node.TempFocus);
-            future += orb.Kind switch
-            {
-                "DarkOrb" => Math.Min(25, orb.Evoke * 0.3),
-                "PlasmaOrb" => 4,
-                "FrostOrb" => nextPassive * 0.7,
-                "LightningOrb" => nextPassive * 0.65,
-                "GlassOrb" => nextPassive * 0.6,
-                _ => 0
-            };
-        }
+            + (orbs.Count == 0 ? Math.Min(2, node.Loop) : 0);
+        future += OrbReserveValue(node, snapshot, orbs, hp);
         future += Math.Max(0, node.Focus - node.TempFocus) * 2;
         future += Math.Clamp((factors.Strength - factors.TemporaryStrength)
             - (initial.Strength - initial.TemporaryStrength), -10, 10) * 2;
@@ -1669,6 +1698,103 @@ internal static class TurnForecastPlanner
             }
         return dealt - totalLoss * 12 + future + Math.Min(30, block - incoming) * 0.01
             - node.Depth * 0.15;
+    }
+
+    // Only score the unspent board after this turn's passive triggers. The
+    // three-turn rollout already scores actual future passive/evoke effects;
+    // these are deliberately modest residual estimates, not another full
+    // round of damage and block. Caps prevent overvaluing orbs past lethal.
+    private static double OrbReserveValue(Node node, Snapshot snapshot,
+        IReadOnlyList<SimOrb> orbs, double[] hp)
+    {
+        double totalHp = hp.Where(value => value > 0).Sum();
+        if (totalHp <= 0 || orbs.Count == 0) return 0;
+        double[] living = hp.Where(value => value > 0).OrderBy(value => value).ToArray();
+        int[] visibleAttack = node.ProjectedIncoming ?? snapshot.Incoming;
+        double futureThreat = hp.Select((value, i) => value <= 0 ? 0 :
+            Math.Clamp(visibleAttack[i] * 0.55 + 4, 4, 35)).Sum();
+        // The next known draw is more actionable than a buried discard card.
+        SimCard[] nextCards = node.Hand.Where(card => card.Retain)
+            .Concat(node.Draw.Skip(node.DrawCursor).Take(snapshot.HandDraw)).ToArray();
+        IEnumerable<SimCard> laterCards = node.Draw
+            .Skip(node.DrawCursor + snapshot.HandDraw).Take(8)
+            .Concat(node.Discard.Take(8))
+            .Concat(node.Hand.Where(card => !card.Retain));
+        bool IsEvoker(SimCard card) => card.Kind is "Dualcast" or "MultiCast"
+            or "Quadcast" or "BdRecursion" or "Recursion" or "Shatter"
+            or "BdShatter";
+        bool Affordable(SimCard card) => card.CostsX
+            ? snapshot.MaxEnergy > 0 : card.CostAfterTurn <= snapshot.MaxEnergy;
+        bool soonEvoker = nextCards.Any(card => IsEvoker(card) && Affordable(card));
+        bool eventualEvoker = !soonEvoker && laterCards.Any(IsEvoker);
+        bool soonChannel = nextCards.Any(card => card.OrbCard && Affordable(card));
+        bool eventualChannel = !soonChannel && laterCards.Any(card => card.OrbCard);
+        double loopFactor = 1 + Math.Min(2, node.Loop) * 0.2;
+        double offense = 0;
+        double frost = 0;
+        double plasma = 0;
+        double nextEvokeChance = orbs.Count >= node.OrbCapacity
+            ? soonChannel ? 0.22 : eventualChannel ? 0.08 : 0 : 0;
+        double availableEnergy = snapshot.MaxEnergy;
+        double nextDemand = nextCards.Sum(card => card.CostsX
+            ? Math.Max(1, snapshot.MaxEnergy) : Math.Clamp(card.CostAfterTurn, 0, 4));
+        double energyShortage = Math.Max(0, nextDemand - availableEnergy);
+        for (int i = 0; i < orbs.Count; i++)
+        {
+            SimOrb orb = orbs[i];
+            double passive = orb.Kind == "PlasmaOrb" ? orb.Passive
+                : Math.Max(0, orb.Passive - node.TempFocus);
+            switch (orb.Kind)
+            {
+                case "LightningOrb":
+                    offense += Math.Min(totalHp, passive * 1.35 * loopFactor);
+                    break;
+                case "GlassOrb":
+                    double tick = passive * loopFactor +
+                        Math.Max(0, passive - 1) * 0.4;
+                    offense += living.Sum(enemyHp => Math.Min(enemyHp, tick));
+                    break;
+                case "DarkOrb":
+                    double outlet = 0.06 + (soonEvoker ? 0.48 : eventualEvoker ? 0.22 : 0)
+                        + (orbs.Count >= node.OrbCapacity && soonChannel ? 0.30
+                            : orbs.Count >= node.OrbCapacity && eventualChannel ? 0.14 : 0);
+                    outlet = Math.Clamp(outlet - i * 0.08, 0.03, 0.85);
+                    double targetBudget = Math.Min(totalHp,
+                        Math.Max(living[0], living[^1] * 0.65));
+                    offense += Math.Min(targetBudget, orb.Evoke + passive * 0.6)
+                        * outlet;
+                    break;
+                case "FrostOrb":
+                    frost += passive * loopFactor;
+                    break;
+                case "PlasmaOrb":
+                    plasma += 0.7 + Math.Min(1, energyShortage) * 3.8;
+                    energyShortage = Math.Max(0, energyShortage - passive);
+                    break;
+            }
+            if (i != 0 || nextEvokeChance <= 0) continue;
+            switch (orb.Kind)
+            {
+                case "LightningOrb":
+                    offense += nextEvokeChance * Math.Min(totalHp, orb.Evoke);
+                    break;
+                case "GlassOrb":
+                    offense += nextEvokeChance *
+                        living.Sum(enemyHp => Math.Min(enemyHp, orb.Evoke));
+                    break;
+                case "FrostOrb":
+                    frost += nextEvokeChance * orb.Evoke;
+                    break;
+                case "PlasmaOrb":
+                    plasma += nextEvokeChance * (energyShortage > 0 ? 6 : 1);
+                    break;
+            }
+        }
+        double healthRisk = node.PlayerHp > 0 ? node.PlayerHp : snapshot.PlayerHp;
+        double protectionWeight = healthRisk <= futureThreat * 1.5 ? 2.2 : 1.2;
+        double defense = Math.Min(frost, futureThreat) * protectionWeight;
+        return Math.Min(totalHp, offense) + Math.Min(22, defense) +
+            Math.Min(14, plasma);
     }
 
     private static double BeamScore(Node node, Snapshot snapshot)
@@ -1689,6 +1815,7 @@ internal static class TurnForecastPlanner
         // Looping zero-cost cards may recreate the same position. Dominance
         // prefers the first (shorter) route, which also prevents frame spikes.
         return $"{node.TurnIndex}:{node.PlayerHp:0.0}:{node.Energy}:{node.Block:0.0}:{node.DrawCursor}:" +
+            $"targetRng={RngCounter(node.TargetRng)}:" +
             $"{node.CardsPlayedThisTurn}:{node.SeriesPlayed}:{node.OrbCapacity}:{node.OtherPowerValue:0.0}:" +
             $"{string.Join(',', node.EnemyHp.Select(h => Math.Round(h)))}:" +
             $"{string.Join(',', node.Hand.Select(c =>
@@ -1712,6 +1839,9 @@ internal static class TurnForecastPlanner
         $"{card.CostAfterPlayedTurn}/{card.Retain}/{card.PermanentRetain}/{card.Ethereal}/" +
         $"{card.Enchant?.Kind}/{card.Enchant?.Amount}/{card.Enchant?.Active}/" +
         $"{card.Enchant?.ExtraReplays}";
+
+    private static int RngCounter(Rng? rng) => rng is null ? -1 :
+        (int?)(RngCounterProperty?.GetValue(rng) ?? RngCounterField?.GetValue(rng)) ?? -1;
     private static (SimCard[], Rng) PredictGenerated(
         SimCard source, Rng state, SimCard[][] pools)
     {

@@ -16,7 +16,7 @@ public static class MainFile
     public static void Initialize()
     {
         new Harmony("LocalAutoPlay").PatchAll();
-        Log.Info("[LocalAutoPlay] v0.5.5 loaded; bounded three-turn forecast, no potions.");
+        Log.Info("[LocalAutoPlay] v0.5.6 loaded; context-aware orb valuation and target RNG, no potions.");
     }
 }
 
