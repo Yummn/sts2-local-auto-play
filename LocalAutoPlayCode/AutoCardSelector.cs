@@ -1,6 +1,7 @@
 using MegaCrit.Sts2.Core.Entities.CardRewardAlternatives;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Localization.DynamicVars;
 using MegaCrit.Sts2.Core.TestSupport;
 
 namespace LocalAutoPlay;
@@ -25,7 +26,7 @@ internal sealed class AutoCardSelector(CardModel source) : ICardSelector
         Func<CardModel, double> value = recycle
             ? card => Math.Max(0, card.EnergyCost.GetAmountToSpend())
             : hand ? card => -LocalPlanner.ChoiceValue(card)
-                   : LocalPlanner.ChoiceValue;
+                   : ContextualChoiceValue;
         CardModel[] ordered = candidates.OrderByDescending(value).ToArray();
         int required = Math.Min(Math.Max(0, minSelect), limit);
         int count = required;
@@ -37,6 +38,25 @@ internal sealed class AutoCardSelector(CardModel source) : ICardSelector
         MainFile.Log.Info($"[LocalAutoPlay] CHOICE source={source.Id.Entry} count={count} " +
             $"cards={string.Join(',', selected.Select(c => c.Id.Entry))}");
         return Task.FromResult<IEnumerable<CardModel>>(selected);
+    }
+
+    private double ContextualChoiceValue(CardModel card)
+    {
+        double score = LocalPlanner.ChoiceValue(card);
+        if (!source.Id.Entry.Contains("SEEK", StringComparison.OrdinalIgnoreCase)
+            || source.Owner.PlayerCombatState is not { } pcs)
+            return score;
+
+        // Fetching more energy has little value when the current hand can
+        // already be paid for. This avoids selecting Turbo at 6+ energy while
+        // useful attacks or draw cards remain in the draw pile.
+        int handCost = pcs.Hand.Cards.Where(other => !ReferenceEquals(other, source))
+            .Sum(other => other.EnergyCost.CostsX ? 0 : Math.Max(0, other.EnergyCost.GetAmountToSpend()));
+        if (pcs.Energy >= handCost + 2
+            && card.DynamicVars.TryGetValue("Energy", out DynamicVar? gain)
+            && gain.BaseValue > 0)
+            score -= 16;
+        return score;
     }
 
     public CardRewardSelection GetSelectedCardReward(

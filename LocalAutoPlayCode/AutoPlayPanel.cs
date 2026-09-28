@@ -3,9 +3,11 @@ using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Context;
 using MegaCrit.Sts2.Core.Entities.Cards;
+using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
+using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Nodes.Cards;
 using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
@@ -18,11 +20,14 @@ public partial class AutoPlayPanel : PanelContainer
     public const string NodeName = "LocalAutoPlayPanel";
     private const int MaxActions = 64;
     private Button? _button;
+    private Button? _fullAutoButton;
     private Label? _status;
     private CancellationTokenSource? _stop;
     private bool _running;
     private bool _planning;
+    private bool _playingAction;
     private bool _stopAfterCurrent;
+    private string _lastStatus = "";
 
     public static void Attach(NCombatUi ui)
     {
@@ -38,7 +43,7 @@ public partial class AutoPlayPanel : PanelContainer
             OffsetLeft = 18f,
             OffsetRight = 216f,
             OffsetTop = 170f,
-            OffsetBottom = 270f,
+            OffsetBottom = 329f,
             MouseFilter = MouseFilterEnum.Pass,
             ZIndex = 94
         };
@@ -62,68 +67,147 @@ public partial class AutoPlayPanel : PanelContainer
         var stack = new VBoxContainer();
         stack.AddThemeConstantOverride("separation", 4);
         AddChild(stack);
-        _button = new Button
-        {
-            Text = "▶ 自动打牌",
-            CustomMinimumSize = new Vector2(166f, 51f),
-            FocusMode = FocusModeEnum.None,
-            MouseFilter = MouseFilterEnum.Stop
-        };
-        _button.AddThemeFontSizeOverride("font_size", 19);
-        _button.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.52f));
-        foreach (string state in new[] { "normal", "hover", "pressed" })
-            _button.AddThemeStyleboxOverride(state, new StyleBoxFlat
-            {
-                BgColor = state == "pressed" ? new Color(0.35f, 0.19f, 0.07f)
-                    : new Color(0.59f, 0.35f, 0.13f),
-                BorderColor = new Color(0.12f, 0.05f, 0.015f),
-                BorderWidthLeft = 4, BorderWidthRight = 4,
-                BorderWidthTop = 4, BorderWidthBottom = 4,
-                CornerRadiusTopLeft = 13, CornerRadiusTopRight = 9,
-                CornerRadiusBottomLeft = 9, CornerRadiusBottomRight = 13
-            });
+        _button = MakeButton("▶ 自动一回合", new Color(0.59f, 0.35f, 0.13f));
         _button.Pressed += OnPressed;
         stack.AddChild(_button);
+        _fullAutoButton = MakeButton("◇ 全自动：关", new Color(0.43f, 0.32f, 0.16f));
+        _fullAutoButton.Pressed += OnFullAutoPressed;
+        stack.AddChild(_fullAutoButton);
         _status = new Label
         {
-            Text = "仅当前回合 · 不用药水",
+            Text = "自动结束回合 · 不用药水",
             HorizontalAlignment = HorizontalAlignment.Center,
             MouseFilter = MouseFilterEnum.Ignore
         };
         _status.AddThemeFontSizeOverride("font_size", 12);
         _status.AddThemeColorOverride("font_color", new Color(0.95f, 0.75f, 0.47f));
         stack.AddChild(_status);
+        RefreshButtons();
+        if (AutoPlaySettings.FullAutoEnabled) StartRunner();
+    }
+
+    private static Button MakeButton(string label, Color background)
+    {
+        var button = new Button
+        {
+            Text = label,
+            CustomMinimumSize = new Vector2(166f, 48f),
+            FocusMode = FocusModeEnum.None,
+            MouseFilter = MouseFilterEnum.Stop
+        };
+        button.AddThemeFontSizeOverride("font_size", 18);
+        button.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.52f));
+        foreach (string state in new[] { "normal", "hover", "pressed" })
+            button.AddThemeStyleboxOverride(state, new StyleBoxFlat
+            {
+                BgColor = state == "pressed" ? background.Darkened(0.25f) : background,
+                BorderColor = new Color(0.12f, 0.05f, 0.015f),
+                BorderWidthLeft = 4, BorderWidthRight = 4,
+                BorderWidthTop = 4, BorderWidthBottom = 4,
+                CornerRadiusTopLeft = 13, CornerRadiusTopRight = 9,
+                CornerRadiusBottomLeft = 9, CornerRadiusBottomRight = 13
+            });
+        return button;
     }
 
     public override void _ExitTree()
     {
         _stop?.Cancel();
-        _stop?.Dispose();
-        _stop = null;
     }
 
-    private async void OnPressed()
+    private void OnPressed()
     {
-        if (_running)
+        if (AutoPlaySettings.FullAutoEnabled)
         {
-            if (_planning)
-            {
-                _stop?.Cancel();
-                SetStatus("规划已取消");
-                return;
-            }
-            _stopAfterCurrent = true;
-            SetStatus("当前牌结算后停止…");
+            AutoPlaySettings.FullAutoEnabled = false;
+            RefreshButtons();
+        }
+        if (_running) { RequestStop(); return; }
+        StartRunner();
+    }
+
+    private void OnFullAutoPressed()
+    {
+        AutoPlaySettings.FullAutoEnabled = !AutoPlaySettings.FullAutoEnabled;
+        RefreshButtons();
+        if (!AutoPlaySettings.FullAutoEnabled)
+        {
+            if (_running) RequestStop();
+            else SetStatus("全自动已关闭");
             return;
         }
+        SetStatus("全自动已开启");
+        if (!_running) StartRunner();
+    }
+
+    private void RequestStop()
+    {
+        if (_playingAction)
+        {
+            _stopAfterCurrent = true;
+            SetStatus("当前牌结算后停止…");
+        }
+        else
+        {
+            _stop?.Cancel();
+            SetStatus("正在停止…");
+        }
+    }
+
+    private void RefreshButtons()
+    {
+        if (GodotObject.IsInstanceValid(_button))
+            _button!.Text = _running ? "■ 停止本回合" : "▶ 自动一回合";
+        if (GodotObject.IsInstanceValid(_fullAutoButton))
+        {
+            _fullAutoButton!.Text = AutoPlaySettings.FullAutoEnabled ? "◆ 全自动：开" : "◇ 全自动：关";
+            _fullAutoButton.AddThemeColorOverride("font_color", AutoPlaySettings.FullAutoEnabled
+                ? new Color(0.76f, 0.95f, 0.57f) : new Color(1f, 0.85f, 0.52f));
+        }
+    }
+
+    private async void StartRunner()
+    {
+        if (_running || !IsInsideTree()) return;
         _running = true;
         _stopAfterCurrent = false;
         _stop = new CancellationTokenSource();
-        _button!.Text = "■ 停止出牌";
-        try { await PlayTurn(_stop.Token); }
+        RefreshButtons();
+        try
+        {
+            int previousTurn = -1;
+            while (true)
+            {
+                var ready = await WaitForTurn(previousTurn, _stop.Token);
+                if (ready is null) break;
+                (CombatState state, Player player, int turn) = ready.Value;
+                bool finished = await PlayTurn(state, player, turn, _stop.Token);
+                _stop.Token.ThrowIfCancellationRequested();
+                if (!finished || _stopAfterCurrent || !CanAct(state, player, turn)) break;
+
+                NEndTurnButton? endButton = NCombatRoom.Instance?.Ui?.EndTurnButton;
+                if (endButton is null) { SetStatus("未找到结束回合按钮"); break; }
+                endButton.CallReleaseLogic();
+                MainFile.Log.Info($"[LocalAutoPlay] END_TURN turn={turn} fullAuto={AutoPlaySettings.FullAutoEnabled}");
+                if (!await WaitForEndTurnAccepted(state, player, turn, _stop.Token))
+                {
+                    AutoPlaySettings.FullAutoEnabled = false;
+                    SetStatus("自动结束回合未生效，请手动结束");
+                    break;
+                }
+                if (!AutoPlaySettings.FullAutoEnabled)
+                {
+                    SetStatus("本回合已完成");
+                    break;
+                }
+                previousTurn = turn;
+                SetStatus("等待下一回合…");
+            }
+        }
         catch (OperationCanceledException) { SetStatus("已停止"); }
         catch (Exception ex)
         {
+            AutoPlaySettings.FullAutoEnabled = false;
             SetStatus("异常，已暂停");
             MainFile.Log.Error($"[LocalAutoPlay] action failed: {ex}");
         }
@@ -131,31 +215,81 @@ public partial class AutoPlayPanel : PanelContainer
         {
             _running = false;
             _planning = false;
-            if (GodotObject.IsInstanceValid(_button))
-                _button!.Text = "▶ 自动打牌";
+            _playingAction = false;
             _stop?.Dispose();
             _stop = null;
+            if (IsInsideTree()) RefreshButtons();
         }
     }
 
-    private async Task PlayTurn(CancellationToken token)
+    private async Task<(CombatState State, Player Player, int Turn)?> WaitForTurn(
+        int previousTurn, CancellationToken token)
     {
-        CombatState? state = CombatManager.Instance.DebugOnlyGetState();
-        Player? player = state is null ? null : LocalContext.GetMe(state);
-        if (state is null || player?.PlayerCombatState is null || state.Players.Count != 1)
-        {
-            SetStatus("仅支持单人战斗");
-            return;
-        }
-        int turn = player.PlayerCombatState.TurnNumber;
-        for (int i = 0; i < MaxActions; i++)
+        while (IsInsideTree())
         {
             token.ThrowIfCancellationRequested();
-            if (!CanAct(state, player, turn))
+            CombatState? state = CombatManager.Instance.DebugOnlyGetState();
+            if (state is not null && CombatManager.Instance.IsInProgress)
             {
-                SetStatus("回合或界面已变化");
-                return;
+                if (state.Players.Count != 1)
+                {
+                    SetStatus("仅支持单人战斗");
+                    return null;
+                }
+                Player? player = LocalContext.GetMe(state);
+                if (player?.PlayerCombatState is { } pcs
+                    && pcs.TurnNumber > previousTurn && CanAct(state, player, pcs.TurnNumber))
+                    return (state, player, pcs.TurnNumber);
             }
+            else if (previousTurn >= 0) return null;
+            await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+        }
+        return null;
+    }
+
+    private async Task<bool> WaitUntilCanAct(CombatState state, Player player,
+        int turn, CancellationToken token)
+    {
+        while (IsInsideTree())
+        {
+            token.ThrowIfCancellationRequested();
+            if (!CombatManager.Instance.IsInProgress
+                || !ReferenceEquals(CombatManager.Instance.DebugOnlyGetState(), state)
+                || player.PlayerCombatState?.TurnNumber != turn
+                || state.CurrentSide != CombatSide.Player)
+                return false;
+            if (CanAct(state, player, turn)) return true;
+            SetStatus("等待结算或界面关闭…");
+            await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+        }
+        return false;
+    }
+
+    private async Task<bool> WaitForEndTurnAccepted(CombatState state, Player player,
+        int turn, CancellationToken token)
+    {
+        for (int frame = 0; frame < 180 && IsInsideTree(); frame++)
+        {
+            token.ThrowIfCancellationRequested();
+            if (!CombatManager.Instance.IsInProgress
+                || !ReferenceEquals(CombatManager.Instance.DebugOnlyGetState(), state)
+                || state.CurrentSide != CombatSide.Player
+                || player.PlayerCombatState?.TurnNumber != turn
+                || CombatManager.Instance.IsPlayerReadyToEndTurn(player)
+                || CombatManager.Instance.PlayerActionsDisabled)
+                return true;
+            await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+        }
+        return false;
+    }
+
+    private async Task<bool> PlayTurn(CombatState state, Player player, int turn,
+        CancellationToken token)
+    {
+        int failedAttempts = 0;
+        for (int i = 0; i < MaxActions; i++)
+        {
+            if (!await WaitUntilCanAct(state, player, turn, token)) return false;
             _planning = true;
             SetStatus("正在预测本回合…");
             LocalMove? move;
@@ -168,27 +302,68 @@ public partial class AutoPlayPanel : PanelContainer
             }
             finally { _planning = false; }
             token.ThrowIfCancellationRequested();
-            if (!CanAct(state, player, turn))
-            {
-                SetStatus("回合或界面已变化");
-                return;
-            }
+            if (!await WaitUntilCanAct(state, player, turn, token)) return false;
+
+            // Even a low-value legal card (such as redundant Defend) should
+            // resolve before the chosen mode advances to the next turn.
+            move ??= ChooseRemaining(state, player);
             if (move is null)
             {
-                SetStatus(i == 0 ? "没有适合自动打出的牌" : $"已打 {i} 张，剩余手动");
-                return;
+                SetStatus($"已打 {i} 张，准备结束回合");
+                return true;
             }
             SetStatus($"出牌 {i + 1}/{MaxActions}");
-            await PlayOne(move.Value, token);
-            MainFile.Log.Info($"[LocalAutoPlay] PLAY turn={turn} index={i + 1} card={move.Value.Card.Id.Entry} score={move.Value.Score:0.0}");
-            if (_stopAfterCurrent)
+            _playingAction = true;
+            try { await PlayOne(move.Value, token); }
+            catch (InvalidOperationException ex)
             {
-                SetStatus("已停止");
-                return;
+                if (++failedAttempts >= 3) throw;
+                MainFile.Log.Warn($"[LocalAutoPlay] stale move, replanning: {ex.Message}");
+                continue;
             }
+            finally { _playingAction = false; }
+            failedAttempts = 0;
+            MainFile.Log.Info($"[LocalAutoPlay] PLAY turn={turn} index={i + 1} " +
+                $"card={move.Value.Card.Id.Entry} score={move.Value.Score:0.0}");
+            if (_stopAfterCurrent) { SetStatus("已停止"); return false; }
             await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
         }
-        SetStatus("已达单次出牌上限");
+        SetStatus("已达单回合出牌上限，准备结束回合");
+        return true;
+    }
+
+    private static LocalMove? ChooseRemaining(CombatState state, Player player)
+    {
+        var candidates = new List<LocalMove>();
+        foreach (CardModel card in player.PlayerCombatState?.Hand.Cards ?? [])
+        {
+            try
+            {
+                if (!card.CanPlay()) continue;
+                if (card.TargetType == TargetType.AnyEnemy)
+                {
+                    foreach (Creature target in state.HittableEnemies.Where(e => e.IsAlive))
+                        if (card.CanPlayTargeting(target))
+                            candidates.Add(new LocalMove(card, target, LocalPlanner.ChoiceValue(card)));
+                }
+                else if (card.TargetType == TargetType.AnyAlly)
+                {
+                    foreach (Creature target in state.Allies.Where(a => a.IsAlive))
+                        if (card.CanPlayTargeting(target))
+                            candidates.Add(new LocalMove(card, target, LocalPlanner.ChoiceValue(card)));
+                }
+                else if (card.CanPlayTargeting(null))
+                    candidates.Add(new LocalMove(card, null, LocalPlanner.ChoiceValue(card)));
+            }
+            catch (Exception ex)
+            {
+                MainFile.Log.Warn($"[LocalAutoPlay] fallback skipped {card.Id.Entry}: {ex.Message}");
+            }
+        }
+        LocalMove? selected = candidates.OrderByDescending(c => c.Score).FirstOrDefault();
+        if (selected is { } value && value.Card is not null)
+            MainFile.Log.Info($"[LocalAutoPlay] FALLBACK card={value.Card.Id.Entry} score={value.Score:0.0}");
+        return selected?.Card is null ? null : selected;
     }
 
     private static bool CanAct(CombatState state, Player player, int turn)
@@ -225,16 +400,18 @@ public partial class AutoPlayPanel : PanelContainer
             if (!move.Card.TryManualPlay(move.Target))
                 throw new InvalidOperationException($"{move.Card.Id.Entry} became unplayable.");
             GameAction action = await source.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
-            await action.CompletionTask.WaitAsync(TimeSpan.FromSeconds(25), token);
+            await action.CompletionTask.WaitAsync(TimeSpan.FromSeconds(45), token);
         }
         finally { executor.BeforeActionExecuted -= Capture; }
     }
 
     private void SetStatus(string value)
     {
+        if (_lastStatus == value) return;
+        _lastStatus = value;
         if (GodotObject.IsInstanceValid(_status))
             _status!.Text = value;
         if (!value.StartsWith("出牌 ", StringComparison.Ordinal))
-            MainFile.Log.Info($"[LocalAutoPlay] STOP status={value}");
+            MainFile.Log.Info($"[LocalAutoPlay] STATUS {value}");
     }
 }

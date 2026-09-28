@@ -35,18 +35,18 @@ internal static class TurnForecastPlanner
         bool DoubleEnergy, bool OrbCard, Generator Generator,
         bool RootPlayable, (int Index, Creature? Target)[] RootTargets,
         bool BestOfThree = false,
-        bool GeneratedFree = false);
+        bool GeneratedFree = false, int ConditionalDrawLimit = 0);
 
     private sealed record Snapshot(
         SimCard[] Hand, SimCard[] Draw, SimCard[] Discard,
         SimCard[][] Pools, Rng ShuffleRng,
-        Rng GenerationRng, int Energy, double Block,
+        Rng GenerationRng, int Energy, int CardsPlayedThisTurn, double Block,
         double PlayerHp, double[] EnemyHp, int[] Incoming);
 
     private sealed record Node(
         SimCard[] Hand, SimCard[] Draw, int DrawCursor, SimCard[] Discard,
         Rng ShuffleRng, Rng GenerationRng,
-        int Energy, double Block, double[] EnemyHp,
+        int Energy, int CardsPlayedThisTurn, double Block, double[] EnemyHp,
         double Score, int Depth, LocalMove? First, string Forecast);
 
     private readonly record struct SearchResult(LocalMove? Move, int Nodes, int Depth,
@@ -97,7 +97,10 @@ internal static class TurnForecastPlanner
         return new Snapshot(hand, draw, discard, pools,
             Fork(player.RunState.Rng.Shuffle),
             Fork(player.RunState.Rng.CombatCardGeneration),
-            Math.Max(0, pcs.Energy), (double)player.Creature.Block,
+            Math.Max(0, pcs.Energy),
+            CombatManager.Instance.History.CardPlaysFinished.Count(entry =>
+                entry.HappenedThisTurn(combat) && entry.CardPlay.Card.Owner == player),
+            (double)player.Creature.Block,
             (double)player.Creature.CurrentHp,
             enemies.Select(e => (double)(e.CurrentHp + e.Block)).ToArray(), incoming);
     }
@@ -144,14 +147,21 @@ internal static class TurnForecastPlanner
             Amount(card, "Block"), (int)Math.Clamp(Amount(card, "Cards"), 0, 10),
             (int)Math.Clamp(Amount(card, "Energy"), 0, 9),
             name == "DoubleEnergy", orb, generator, playable, targets.ToArray(),
-            name == "WhiteNoise" && IsBetterDefectRework(card));
+            name == "WhiteNoise" && IsBetterDefectRework(card),
+            ConditionalDrawLimit: name switch
+            {
+                "Ftl" => (int)Amount(card, "PlayMax", card.IsUpgraded ? 4 : 3),
+                "Supercritical" => (int)Amount(card, "PlayMax", 4),
+                _ => 0
+            });
     }
 
     private static SearchResult Search(Snapshot snapshot, CancellationToken token)
     {
         List<Node> frontier = [new Node(snapshot.Hand, snapshot.Draw, 0,
             snapshot.Discard, snapshot.ShuffleRng, snapshot.GenerationRng,
-            snapshot.Energy, snapshot.Block, snapshot.EnemyHp, 0, 0, null, "")];
+            snapshot.Energy, snapshot.CardsPlayedThisTurn,
+            snapshot.Block, snapshot.EnemyHp, 0, 0, null, "")];
         Node? best = null;
         Stopwatch watch = Stopwatch.StartNew();
         int expanded = 0;
@@ -254,6 +264,9 @@ internal static class TurnForecastPlanner
         string forecast = node.Forecast;
         int requestedDraw = card.Generator is Generator.JackOfAllTrades or Generator.BundleOfJoy
             ? 0 : card.Draw;
+        if (card.ConditionalDrawLimit > 0)
+            requestedDraw = node.CardsPlayedThisTurn < card.ConditionalDrawLimit
+                ? Math.Max(1, requestedDraw) : 0;
         for (int i = 0; i < requestedDraw && hand.Count < 10; i++)
         {
             if (drawCursor >= draw.Length && discard.Count > 0)
@@ -298,7 +311,8 @@ internal static class TurnForecastPlanner
         LocalMove first = node.First ?? new LocalMove(card.Model, target, value);
         double score = node.Score + value * Math.Pow(0.975, node.Depth);
         return new Node(hand.ToArray(), draw, drawCursor, discard.ToArray(),
-            shuffleRng, generationRng, Math.Min(99, energy), node.Block + card.Block,
+            shuffleRng, generationRng, Math.Min(99, energy),
+            node.CardsPlayedThisTurn + 1, node.Block + card.Block,
             hp, score, node.Depth + 1, first, forecast);
 
         double Deal(int i, double multiplier)

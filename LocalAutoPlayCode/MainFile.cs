@@ -16,7 +16,7 @@ public static class MainFile
     public static void Initialize()
     {
         new Harmony("LocalAutoPlay").PatchAll();
-        Log.Info("[LocalAutoPlay] v0.4.0 loaded; draw-order/RNG forecast, bounded turn search, no potions.");
+        Log.Info("[LocalAutoPlay] v0.4.1 loaded; one-turn/full-auto, draw-order forecast, no potions.");
     }
 }
 
