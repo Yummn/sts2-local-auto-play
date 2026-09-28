@@ -16,7 +16,7 @@ public static class MainFile
     public static void Initialize()
     {
         new Harmony("LocalAutoPlay").PatchAll();
-        Log.Info("[LocalAutoPlay] v0.5.3 loaded; relic and combat-power forecast, no potions.");
+        Log.Info("[LocalAutoPlay] v0.5.4 loaded; enchantment and temporary-state forecast, no potions.");
     }
 }
 

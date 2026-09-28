@@ -415,7 +415,10 @@ public partial class AutoPlayPanel : PanelContainer
             bool playable;
             try { playable = card.CanPlay(); }
             catch { playable = false; }
-            return $"{RuntimeHelpers.GetHashCode(card)}/{playable}";
+            var enchant = card.Enchantment;
+            return $"{RuntimeHelpers.GetHashCode(card)}/{playable}/" +
+                $"{card.EnergyCost.GetAmountToSpend()}/" +
+                $"{enchant?.Id.Entry}/{enchant?.Status}/{enchant?.Amount}";
         }));
         string orbs = string.Join(',', pcs.OrbQueue.Orbs.Select(orb =>
             $"{orb.GetType().Name}/{orb.EvokeVal}"));
