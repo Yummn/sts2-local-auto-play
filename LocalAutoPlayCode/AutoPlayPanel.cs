@@ -16,11 +16,12 @@ namespace LocalAutoPlay;
 public partial class AutoPlayPanel : PanelContainer
 {
     public const string NodeName = "LocalAutoPlayPanel";
-    private const int MaxActions = 24;
+    private const int MaxActions = 64;
     private Button? _button;
     private Label? _status;
     private CancellationTokenSource? _stop;
     private bool _running;
+    private bool _planning;
     private bool _stopAfterCurrent;
 
     public static void Attach(NCombatUi ui)
@@ -105,6 +106,12 @@ public partial class AutoPlayPanel : PanelContainer
     {
         if (_running)
         {
+            if (_planning)
+            {
+                _stop?.Cancel();
+                SetStatus("规划已取消");
+                return;
+            }
             _stopAfterCurrent = true;
             SetStatus("当前牌结算后停止…");
             return;
@@ -123,6 +130,7 @@ public partial class AutoPlayPanel : PanelContainer
         finally
         {
             _running = false;
+            _planning = false;
             if (GodotObject.IsInstanceValid(_button))
                 _button!.Text = "▶ 自动打牌";
             _stop?.Dispose();
@@ -148,7 +156,23 @@ public partial class AutoPlayPanel : PanelContainer
                 SetStatus("回合或界面已变化");
                 return;
             }
-            LocalMove? move = LocalPlanner.Choose(state, player);
+            _planning = true;
+            SetStatus("正在预测本回合…");
+            LocalMove? move;
+            try { move = await TurnForecastPlanner.ChooseAsync(state, player, token); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                MainFile.Log.Warn($"[LocalAutoPlay] forecast unavailable; using fallback: {ex}");
+                move = LocalPlanner.Choose(state, player);
+            }
+            finally { _planning = false; }
+            token.ThrowIfCancellationRequested();
+            if (!CanAct(state, player, turn))
+            {
+                SetStatus("回合或界面已变化");
+                return;
+            }
             if (move is null)
             {
                 SetStatus(i == 0 ? "没有适合自动打出的牌" : $"已打 {i} 张，剩余手动");
