@@ -1044,21 +1044,28 @@ internal static class TurnForecastPlanner
                 }
                 break;
             case "MultiCast":
-                for (int i = 0; i < Math.Min(12, cost + (card.Upgrade > 0 ? 1 : 0))
-                    && orbs.Count > 0; i++)
+                int multicastCount = Math.Min(12, cost + (card.Upgrade > 0 ? 1 : 0));
+                if (!card.Reworked && multicastCount > 0 && orbs.Count > 0)
                 {
+                    // OrbCmd.EvokeNext removes the orb only on its final evoke.
+                    // Repeating against a single orb must not discard it early.
                     SimOrb first = orbs[0];
-                    Evoke(first, hp, ref block, ref energy, factors, targetRng);
-                    if (card.Reworked) Evoke(first, hp, ref block, ref energy, factors, targetRng);
+                    for (int i = 0; i < multicastCount; i++)
+                        Evoke(first, hp, ref block, ref energy, factors, targetRng);
                     orbs.RemoveAt(0);
-                    if (card.Reworked)
-                    {
-                        // The rework restores the same type; a dark orb keeps
-                        // the charge of the evoked orb.
-                        Channel(orbs, ref capacity, first.Kind, focus, hp,
-                            ref block, ref energy, factors, targetRng, first.Kind == "DarkOrb"
-                                ? first.Evoke : null);
-                    }
+                }
+                else for (int i = 0; i < multicastCount && orbs.Count > 0; i++)
+                {
+                    // BetterDefect treats queue index 0 as the visual rightmost orb.
+                    SimOrb selected = orbs[0];
+                    Evoke(selected, hp, ref block, ref energy, factors, targetRng);
+                    Evoke(selected, hp, ref block, ref energy, factors, targetRng);
+                    orbs.RemoveAt(0);
+                    // The rework restores the same type; a dark orb keeps
+                    // the charge of the evoked orb.
+                    Channel(orbs, ref capacity, selected.Kind, focus, hp,
+                        ref block, ref energy, factors, targetRng, selected.Kind == "DarkOrb"
+                            ? selected.Evoke : null);
                 }
                 break;
             case "BdRecursion":
