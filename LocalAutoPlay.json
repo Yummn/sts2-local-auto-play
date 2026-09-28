@@ -1,0 +1,12 @@
+{
+  "id": "LocalAutoPlay",
+  "name": "局部自动出牌",
+  "author": "Codex",
+  "description": "单人战斗中点击按钮，逐张评估并打出当前回合的安全卡牌；不自动结束回合或使用药水。无需 BaseLib。",
+  "version": "0.1.0",
+  "min_game_version": "0.107.1",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": true
+}
