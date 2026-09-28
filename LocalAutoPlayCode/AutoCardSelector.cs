@@ -10,14 +10,34 @@ namespace LocalAutoPlay;
 /// Supplies native CardSelectCmd choices only while one of our own card actions
 /// is resolving.  Never touches the player's reward screens outside combat.
 /// </summary>
-internal sealed class AutoCardSelector(CardModel source) : ICardSelector
+internal sealed class AutoCardSelector(CardModel source, IReadOnlyList<CardModel>? planned = null) : ICardSelector
 {
+    internal AutoCardSelector(CardModel source) : this(source, null) { }
+
     public Task<IEnumerable<CardModel>> GetSelectedCards(
         IEnumerable<CardModel> options, int minSelect, int maxSelect)
     {
         CardModel[] candidates = options.ToArray();
         int limit = Math.Max(0, Math.Min(maxSelect, candidates.Length));
         if (limit == 0) return Task.FromResult<IEnumerable<CardModel>>([]);
+
+        if (planned is { Count: > 0 })
+        {
+            List<CardModel> actual = new();
+            foreach (CardModel wanted in planned)
+            {
+                CardModel? match = candidates.FirstOrDefault(c => ReferenceEquals(c, wanted))
+                    ?? candidates.FirstOrDefault(c => c.Id == wanted.Id && !actual.Contains(c));
+                if (match is not null && !actual.Contains(match) && actual.Count < limit)
+                    actual.Add(match);
+            }
+            if (actual.Count >= minSelect)
+            {
+                MainFile.Log.Info($"[LocalAutoPlay] PLANNED_CHOICE source={source.Id.Entry} " +
+                    $"cards={string.Join(',', actual.Select(c => c.Id.Entry))}");
+                return Task.FromResult<IEnumerable<CardModel>>(actual);
+            }
+        }
 
         // A hand choice usually discards or exhausts; draw/discard choices
         // usually retrieve or play.  Recycle is the notable hand exception.
@@ -30,9 +50,11 @@ internal sealed class AutoCardSelector(CardModel source) : ICardSelector
         CardModel[] ordered = candidates.OrderByDescending(value).ToArray();
         int required = Math.Min(Math.Max(0, minSelect), limit);
         int count = required;
-        // Optional selections may be skipped. Do not force a weak card into the
-        // hand or voluntarily discard a valuable one merely because it exists.
-        if (required == 0 && value(ordered[0]) > 0)
+        // Optional retrieval should take every useful card up to the native
+        // limit (Neow's Fury can retrieve more than one), not just one.
+        if (required == 0 && !hand)
+            count = Math.Min(limit, ordered.Count(c => value(c) > 0));
+        else if (required == 0 && value(ordered[0]) > 0)
             count = 1;
         CardModel[] selected = ordered.Take(count).ToArray();
         MainFile.Log.Info($"[LocalAutoPlay] CHOICE source={source.Id.Entry} count={count} " +

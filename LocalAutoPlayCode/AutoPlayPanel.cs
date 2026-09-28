@@ -304,9 +304,6 @@ public partial class AutoPlayPanel : PanelContainer
             token.ThrowIfCancellationRequested();
             if (!await WaitUntilCanAct(state, player, turn, token)) return false;
 
-            // Even a low-value legal card (such as redundant Defend) should
-            // resolve before the chosen mode advances to the next turn.
-            move ??= ChooseRemaining(state, player);
             if (move is null)
             {
                 SetStatus($"已打 {i} 张，准备结束回合");
@@ -330,40 +327,6 @@ public partial class AutoPlayPanel : PanelContainer
         }
         SetStatus("已达单回合出牌上限，准备结束回合");
         return true;
-    }
-
-    private static LocalMove? ChooseRemaining(CombatState state, Player player)
-    {
-        var candidates = new List<LocalMove>();
-        foreach (CardModel card in player.PlayerCombatState?.Hand.Cards ?? [])
-        {
-            try
-            {
-                if (!card.CanPlay()) continue;
-                if (card.TargetType == TargetType.AnyEnemy)
-                {
-                    foreach (Creature target in state.HittableEnemies.Where(e => e.IsAlive))
-                        if (card.CanPlayTargeting(target))
-                            candidates.Add(new LocalMove(card, target, LocalPlanner.ChoiceValue(card)));
-                }
-                else if (card.TargetType == TargetType.AnyAlly)
-                {
-                    foreach (Creature target in state.Allies.Where(a => a.IsAlive))
-                        if (card.CanPlayTargeting(target))
-                            candidates.Add(new LocalMove(card, target, LocalPlanner.ChoiceValue(card)));
-                }
-                else if (card.CanPlayTargeting(null))
-                    candidates.Add(new LocalMove(card, null, LocalPlanner.ChoiceValue(card)));
-            }
-            catch (Exception ex)
-            {
-                MainFile.Log.Warn($"[LocalAutoPlay] fallback skipped {card.Id.Entry}: {ex.Message}");
-            }
-        }
-        LocalMove? selected = candidates.OrderByDescending(c => c.Score).FirstOrDefault();
-        if (selected is { } value && value.Card is not null)
-            MainFile.Log.Info($"[LocalAutoPlay] FALLBACK card={value.Card.Id.Entry} score={value.Score:0.0}");
-        return selected?.Card is null ? null : selected;
     }
 
     private static bool CanAct(CombatState state, Player player, int turn)
@@ -396,7 +359,8 @@ public partial class AutoPlayPanel : PanelContainer
         executor.BeforeActionExecuted += Capture;
         try
         {
-            using IDisposable selector = CardSelectCmd.PushSelector(new AutoCardSelector(move.Card));
+            using IDisposable selector = CardSelectCmd.PushSelector(
+                new AutoCardSelector(move.Card, move.SelectedCards));
             if (!move.Card.TryManualPlay(move.Target))
                 throw new InvalidOperationException($"{move.Card.Id.Entry} became unplayable.");
             GameAction action = await source.Task.WaitAsync(TimeSpan.FromSeconds(5), token);

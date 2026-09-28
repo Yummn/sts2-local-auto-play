@@ -9,7 +9,9 @@ using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 
 namespace LocalAutoPlay;
 
-internal readonly record struct LocalMove(CardModel Card, Creature? Target, double Score);
+internal readonly record struct LocalMove(
+    CardModel Card, Creature? Target, double Score,
+    IReadOnlyList<CardModel>? SelectedCards = null);
 
 /// <summary>
 /// A bounded, side-effect-free approximation of the current turn. Only one

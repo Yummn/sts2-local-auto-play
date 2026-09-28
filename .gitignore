@@ -4,3 +4,4 @@ obj/
 local.props
 *.user
 *.pdb
+.obj-localautoplay-*/
