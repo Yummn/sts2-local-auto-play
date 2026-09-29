@@ -27,13 +27,16 @@ internal static class TurnForecastPlanner
 {
     private const int MaxDepth = 48;
     private const int ForecastTurns = 3;
-    private const int FutureTurnDepth = 12;
+    private const int FutureTurnDepth = 8;
     private const int CurrentSearchMs = 170;
-    private const int TotalSearchMs = 420;
+    private const int TotalSearchMs = 350;
     private const int BeamWidth = 48;
     private const int MaxNodes = 16000;
-    private const int FutureBeamWidth = 12;
-    private const int FutureExpansions = 140;
+    private const int FutureBeamWidth = 8;
+    private const int FutureExpansions = 64;
+    private const int MaxForecastCandidates = 3;
+    private const double ForecastTieWindow = 2.5;
+    private const double MaxForecastAdjustment = 2.5;
     private static readonly Lazy<MethodInfo?> ReworkCheckMethod = new(() =>
         AppDomain.CurrentDomain.GetAssemblies()
             .FirstOrDefault(a => a.GetName().Name == "BetterDefect")?
@@ -136,8 +139,10 @@ internal static class TurnForecastPlanner
     private static PlanCache? _cachedPlan;
 
     private readonly record struct SearchResult(LocalMove? Move, int Nodes, int Depth,
-        bool Exhaustive, string Forecast, PlanStep? Plan);
-    private readonly record struct FutureResult(double Score, string Forecast);
+        bool Exhaustive, string Forecast, PlanStep? Plan, double ImmediateScore,
+        double ForecastAdjustment, string Alternatives, string FutureComparison);
+    private readonly record struct FutureResult(double Score, string Forecast, bool Complete);
+    private readonly record struct FutureTurnResult(IReadOnlyList<Node> Nodes, bool Complete);
 
     public static async Task<LocalMove?> ChooseAsync(
         CombatState combat, Player player, CancellationToken token)
@@ -156,7 +161,10 @@ internal static class TurnForecastPlanner
         MainFile.Log.Info($"[LocalAutoPlay] PLAN nodes={result.Nodes} depth={result.Depth} " +
             $"captureMs={captureMs} totalMs={elapsed.ElapsedMilliseconds} " +
             $"cachedSteps={steps.Length} " +
-            $"exhaustive={result.Exhaustive} forecast={result.Forecast} " +
+            $"exhaustive={result.Exhaustive} immediate={result.ImmediateScore:0.0} " +
+            $"futureDelta={result.ForecastAdjustment:+0.0;-0.0;0.0} " +
+            $"alternatives={result.Alternatives} future={result.FutureComparison} " +
+            $"forecast={result.Forecast} " +
             $"first={result.Move?.Card.Id.Entry ?? "none"}");
         return result.Move;
     }
@@ -568,10 +576,7 @@ internal static class TurnForecastPlanner
             new(StringComparer.Ordinal);
         void KeepBoundary(Node candidate, double score)
         {
-            string id = candidate.First is { } move
-                ? $"{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Card)}/" +
-                  $"{(move.Target is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Target))}"
-                : "end-now";
+            string id = FirstIdentity(candidate);
             if (!boundary.TryGetValue(id, out List<(Node Node, double Score)>? choices))
                 boundary[id] = choices = new List<(Node Node, double Score)>(2);
             choices.Add((candidate, score));
@@ -597,7 +602,10 @@ internal static class TurnForecastPlanner
                         if ((expanded & 63) == 0)
                         {
                             token.ThrowIfCancellationRequested();
-                            if (expanded >= MaxNodes || watch.ElapsedMilliseconds >= CurrentSearchMs)
+                            // Always examine every legal first action before
+                            // the time limit can prune a branch.
+                            if (depth > 0 && (expanded >= MaxNodes ||
+                                watch.ElapsedMilliseconds >= CurrentSearchMs))
                             { cutoff = true; break; }
                         }
                         Node? child = Apply(node, card, handIndex, targetIndex, target,
@@ -605,12 +613,18 @@ internal static class TurnForecastPlanner
                         if (child is null) continue;
                         expanded++;
                         deepest = Math.Max(deepest, child.Depth);
-                        double terminal = EvaluateEnd(child, snapshot);
-                        KeepBoundary(child, terminal);
-                        if (terminal > bestScore + 0.001)
+                        // A temporary-energy card is useful only as a setup
+                        // for another action this turn. Never treat "play
+                        // Turbo, then immediately end" as a terminal plan.
+                        if (!IsPureEnergyAction(card, node))
                         {
-                            best = child;
-                            bestScore = terminal;
+                            double terminal = EvaluateEnd(child, snapshot);
+                            KeepBoundary(child, terminal);
+                            if (terminal > bestScore + 0.001)
+                            {
+                                best = child;
+                                bestScore = terminal;
+                            }
                         }
                         if (child.EnemyHp.Any(h => h > 0))
                         {
@@ -629,45 +643,133 @@ internal static class TurnForecastPlanner
                 if (cutoff) break;
             }
             if (next.Count > BeamWidth) cutoff = true;
-            frontier = next.OrderByDescending(n => BeamScore(n, snapshot))
-                .Take(BeamWidth).ToList();
+            frontier = BalancedFrontier(next, snapshot);
             if (cutoff && (expanded >= MaxNodes || watch.ElapsedMilliseconds >= CurrentSearchMs)) break;
         }
         if (deepest >= MaxDepth) cutoff = true;
         string bestTrace = best.Forecast;
-        if (bestScore < 10000)
+        double immediateScore = bestScore;
+        double forecastAdjustment = 0;
+        string futureComparison = "not-run";
+        string alternatives = string.Join(',', boundary.Values
+            .Select(group => group[0]).OrderByDescending(item => item.Score).Take(4)
+            .Select(item => $"{item.Node.First?.Card.Id.Entry ?? "END"}:{item.Score:0.0}"));
+        // Future enemy intents are guesses. Only use the three-turn model as
+        // a bounded tie-break between currently near-equivalent first moves.
+        // If every shortlisted move cannot receive a fair budget, retain the
+        // best verified current-turn plan instead of comparing partial work.
+        if (bestScore is > -10000 and < 10000)
         {
-            double bestForecast = double.NegativeInfinity;
-            foreach (Node candidate in boundary.Values.SelectMany(c => c)
-                .OrderByDescending(c => c.Score)
-                .Select(c => c.Node).DistinctBy(StateKey).Take(14))
+            (Node Node, double Score)[] shortlist = boundary.Values
+                .Select(group => group[0])
+                .Where(item => item.Score >= immediateScore - ForecastTieWindow)
+                .OrderByDescending(item => item.Score)
+                .Take(MaxForecastCandidates).ToArray();
+            if (shortlist.Length > 1)
             {
-                if (watch.ElapsedMilliseconds >= TotalSearchMs) { cutoff = true; break; }
-                FutureResult forecast = ForecastThreeTurns(candidate, snapshot, watch, token);
-                if (forecast.Score <= bestForecast + 0.001) continue;
-                best = candidate;
-                bestForecast = forecast.Score;
-                bestScore = forecast.Score;
-                bestTrace = forecast.Forecast;
+                List<(Node Node, double Immediate, double Future, string Trace)> forecasts = [];
+                bool complete = true;
+                for (int i = 0; i < shortlist.Length; i++)
+                {
+                    int left = shortlist.Length - i;
+                    long remaining = TotalSearchMs - watch.ElapsedMilliseconds;
+                    if (remaining < left * 20) { complete = false; break; }
+                    long deadline = watch.ElapsedMilliseconds + Math.Min(85, remaining / left);
+                    FutureResult forecast = ForecastThreeTurns(shortlist[i].Node,
+                        snapshot, watch, deadline, token);
+                    if (!forecast.Complete) { complete = false; break; }
+                    forecasts.Add((shortlist[i].Node, shortlist[i].Score,
+                        forecast.Score, forecast.Forecast));
+                }
+                if (complete)
+                {
+                    // Absolute future scores include cumulative damage and
+                    // speculative intent. Subtract the best forecast in this
+                    // SAME shortlist; otherwise all candidates hit the same
+                    // positive clamp and the tie-break changes nothing.
+                    double topFuture = forecasts.Max(item => item.Future);
+                    futureComparison = string.Join(',', forecasts.Select(item =>
+                        $"{item.Node.First?.Card.Id.Entry ?? "END"}:{item.Future:0.0}"));
+                    var winner = forecasts.Select(item => new
+                    {
+                        item.Node,
+                        item.Trace,
+                        Adjustment = Math.Clamp((item.Future - topFuture) * 0.12,
+                            -MaxForecastAdjustment, 0),
+                        item.Immediate
+                    }).OrderByDescending(item => item.Immediate + item.Adjustment)
+                      .First();
+                    best = winner.Node;
+                    bestScore = winner.Immediate + winner.Adjustment;
+                    forecastAdjustment = winner.Adjustment;
+                    bestTrace = winner.Trace;
+                }
+                else { cutoff = true; futureComparison = "incomplete"; }
             }
         }
         return new SearchResult(best.First is { } first ? first with { Score = bestScore } : null,
-            expanded, deepest, !cutoff, bestTrace, best.Plan);
+            expanded, deepest, !cutoff, bestTrace, best.Plan, immediateScore,
+            forecastAdjustment, alternatives, futureComparison);
+    }
+
+    private static string FirstIdentity(Node node) => node.First is { } move
+        ? $"{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Card)}/" +
+          $"{(move.Target is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(move.Target))}"
+        : "end-now";
+
+    private static bool IsPureEnergyAction(SimCard card, Node parent)
+    {
+        if (card.Kind is not ("Turbo" or "DoubleEnergy") ||
+            card.Kind == "DoubleEnergy" && card.Reworked ||
+            card.Damage > 0 || card.Block > 0 || card.Draw > 0 ||
+            card.Enchant is { Active: true })
+            return false;
+        BattleFactors factors = parent.Factors ?? BattleFactors.Empty(parent.EnemyHp.Length);
+        return factors.LetterOpener < 0 || (factors.LetterOpener + 1) % 3 != 0;
+    }
+
+    private static List<Node> BalancedFrontier(List<Node> options, Snapshot snapshot)
+    {
+        Node[] ranked = options.OrderByDescending(n => BeamScore(n, snapshot)).ToArray();
+        List<Node> result = new(Math.Min(BeamWidth, ranked.Length));
+        HashSet<string> firstMoves = new(StringComparer.Ordinal);
+        HashSet<Node> chosen = new(ReferenceEqualityComparer.Instance);
+        foreach (Node node in ranked)
+            if (firstMoves.Add(FirstIdentity(node)) && chosen.Add(node))
+            {
+                result.Add(node);
+                if (result.Count == BeamWidth) return result;
+            }
+        foreach (Node node in ranked)
+            if (chosen.Add(node))
+            {
+                result.Add(node);
+                if (result.Count == BeamWidth) break;
+            }
+        return result;
     }
 
     private static FutureResult ForecastThreeTurns(Node firstTurn, Snapshot snapshot,
-        Stopwatch watch, CancellationToken token)
+        Stopwatch watch, long deadlineMs, CancellationToken token)
     {
         double firstScore = EvaluateEnd(firstTurn, snapshot);
         if (firstScore >= 10000 || firstScore <= -10000)
-            return new FutureResult(firstScore, firstTurn.Forecast);
+            return new FutureResult(firstScore, firstTurn.Forecast, true);
+        if (watch.ElapsedMilliseconds >= deadlineMs)
+            return new FutureResult(firstScore, firstTurn.Forecast, false);
         Node? secondStart = AdvanceTurn(firstTurn, snapshot);
         if (secondStart is null)
-            return new FutureResult(firstScore, firstTurn.Forecast);
+            return new FutureResult(firstScore, firstTurn.Forecast, true);
         double best = double.NegativeInfinity;
         string bestTrace = firstTurn.Forecast;
-        foreach (Node second in SearchFutureTurn(secondStart, snapshot, watch, token))
+        FutureTurnResult secondOptions = SearchFutureTurn(secondStart, snapshot,
+            watch, deadlineMs, token);
+        if (!secondOptions.Complete)
+            return new FutureResult(firstScore, firstTurn.Forecast, false);
+        foreach (Node second in secondOptions.Nodes)
         {
+            if (watch.ElapsedMilliseconds >= deadlineMs)
+                return new FutureResult(firstScore, firstTurn.Forecast, false);
             double secondScore = EvaluateEnd(second, snapshot);
             if (secondScore >= 10000 || secondScore <= -10000)
             {
@@ -682,17 +784,20 @@ internal static class TurnForecastPlanner
                 if (value > best) { best = value; bestTrace = second.Forecast; }
                 continue;
             }
-            Node third = SearchFutureTurn(thirdStart, snapshot, watch, token)
+            FutureTurnResult thirdOptions = SearchFutureTurn(thirdStart, snapshot,
+                watch, deadlineMs, token);
+            if (!thirdOptions.Complete)
+                return new FutureResult(firstScore, firstTurn.Forecast, false);
+            Node third = thirdOptions.Nodes
                 .OrderByDescending(n => EvaluateEnd(n, snapshot)).First();
             double thirdScore = EvaluateEnd(third, snapshot);
             double total = 0.55 * firstScore + 0.30 * FutureScore(secondScore) +
                 0.15 * FutureScore(thirdScore);
             if (total > best) { best = total; bestTrace = third.Forecast; }
-            if (watch.ElapsedMilliseconds >= TotalSearchMs) break;
         }
         return double.IsNegativeInfinity(best)
-            ? new FutureResult(firstScore, firstTurn.Forecast)
-            : new FutureResult(best, bestTrace);
+            ? new FutureResult(firstScore, firstTurn.Forecast, true)
+            : new FutureResult(best, bestTrace, true);
     }
 
     // Future intent and distant shuffles are estimates. A speculative kill must
@@ -700,15 +805,15 @@ internal static class TurnForecastPlanner
     private static double FutureScore(double score) => score >= 10000
         ? 150 + Math.Min(100, score - 10000) : score;
 
-    private static IReadOnlyList<Node> SearchFutureTurn(Node start, Snapshot snapshot,
-        Stopwatch watch, CancellationToken token)
+    private static FutureTurnResult SearchFutureTurn(Node start, Snapshot snapshot,
+        Stopwatch watch, long deadlineMs, CancellationToken token)
     {
         List<Node> candidates = [start];
         List<Node> frontier = [start];
         Dictionary<string, double> visited = new(StringComparer.Ordinal);
         int expanded = 0;
         for (int depth = 0; depth < FutureTurnDepth && frontier.Count > 0 &&
-            expanded < FutureExpansions && watch.ElapsedMilliseconds < TotalSearchMs; depth++)
+            expanded < FutureExpansions && watch.ElapsedMilliseconds < deadlineMs; depth++)
         {
             List<Node> next = new();
             foreach (Node node in frontier)
@@ -725,7 +830,7 @@ internal static class TurnForecastPlanner
                         if ((expanded & 31) == 0)
                         {
                             token.ThrowIfCancellationRequested();
-                            if (watch.ElapsedMilliseconds >= TotalSearchMs) break;
+                            if (watch.ElapsedMilliseconds >= deadlineMs) break;
                         }
                         Node? child = Apply(node, card, handIndex, targetIndex,
                             target, snapshot);
@@ -746,10 +851,10 @@ internal static class TurnForecastPlanner
                         if (expanded >= FutureExpansions) break;
                     }
                     if (expanded >= FutureExpansions ||
-                        watch.ElapsedMilliseconds >= TotalSearchMs) break;
+                        watch.ElapsedMilliseconds >= deadlineMs) break;
                 }
                 if (expanded >= FutureExpansions ||
-                    watch.ElapsedMilliseconds >= TotalSearchMs) break;
+                    watch.ElapsedMilliseconds >= deadlineMs) break;
             }
             frontier = next.OrderByDescending(n => BeamScore(n, snapshot))
                 .Take(FutureBeamWidth).ToList();
@@ -760,7 +865,8 @@ internal static class TurnForecastPlanner
             .GroupBy(n => n.FutureFirst, StringComparer.Ordinal)
             .Select(group => group.OrderByDescending(n => EvaluateEnd(n, snapshot)).First())
             .OrderByDescending(n => EvaluateEnd(n, snapshot)).Take(3).ToArray();
-        return [start, .. options];
+        return new FutureTurnResult([start, .. options],
+            watch.ElapsedMilliseconds < deadlineMs);
     }
 
     private static Node? AdvanceTurn(Node node, Snapshot snapshot)
