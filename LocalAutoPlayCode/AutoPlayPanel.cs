@@ -214,6 +214,7 @@ public partial class AutoPlayPanel : PanelContainer
         }
         finally
         {
+            TurnForecastPlanner.ClearCachedPlan();
             _running = false;
             _planning = false;
             _playingAction = false;
@@ -299,21 +300,27 @@ public partial class AutoPlayPanel : PanelContainer
         {
             if (!await WaitUntilCanAct(state, player, turn, token)) return false;
             string plannedFrom = CombatSignature(state, player);
-            _planning = true;
-            SetStatus("正在预测本回合…");
             LocalMove? move;
-            try { move = await TurnForecastPlanner.ChooseAsync(state, player, token); }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
+            if (TurnForecastPlanner.TryUseCachedNext(state, player, turn, out move))
+                SetStatus("沿用已验证的出牌顺序…");
+            else
             {
-                MainFile.Log.Warn($"[LocalAutoPlay] forecast unavailable; using fallback: {ex}");
-                move = LocalPlanner.Choose(state, player);
+                _planning = true;
+                SetStatus("正在预测本回合…");
+                try { move = await TurnForecastPlanner.ChooseAsync(state, player, token); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    MainFile.Log.Warn($"[LocalAutoPlay] forecast unavailable; using fallback: {ex}");
+                    move = LocalPlanner.Choose(state, player);
+                }
+                finally { _planning = false; }
             }
-            finally { _planning = false; }
             token.ThrowIfCancellationRequested();
             if (!await WaitUntilCanAct(state, player, turn, token)) return false;
             if (CombatSignature(state, player) != plannedFrom)
             {
+                TurnForecastPlanner.ClearCachedPlan();
                 if (++stalePlanRetries > 4)
                 {
                     SetStatus("局面持续变化，已暂停自动出牌");
@@ -346,6 +353,7 @@ public partial class AutoPlayPanel : PanelContainer
             try { await PlayOne(move.Value, token); }
             catch (InvalidOperationException ex)
             {
+                TurnForecastPlanner.ClearCachedPlan();
                 if (++failedAttempts >= 3) throw;
                 MainFile.Log.Warn($"[LocalAutoPlay] stale move, replanning: {ex.Message}");
                 continue;

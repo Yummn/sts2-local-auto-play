@@ -19,20 +19,21 @@ namespace LocalAutoPlay;
 /// <summary>
 /// Snapshots the known draw order and RNG streams on the game thread, then
 /// searches a pure, bounded turn model on a worker. Never plays preview actions
-/// or advances the game's real RNG. Every executed card is followed by a fresh
-/// snapshot, so a forecast mismatch cannot compound into subsequent actions.
+/// or advances the game's real RNG. After a real card resolves, the predicted
+/// state is checked before reusing the next step; any mismatch forces a fresh
+/// snapshot and search rather than compounding forecast errors.
 /// </summary>
 internal static class TurnForecastPlanner
 {
     private const int MaxDepth = 48;
     private const int ForecastTurns = 3;
     private const int FutureTurnDepth = 12;
-    private const int CurrentSearchMs = 350;
-    private const int TotalSearchMs = 950;
-    private const int BeamWidth = 72;
-    private const int MaxNodes = 30000;
-    private const int FutureBeamWidth = 18;
-    private const int FutureExpansions = 240;
+    private const int CurrentSearchMs = 170;
+    private const int TotalSearchMs = 420;
+    private const int BeamWidth = 48;
+    private const int MaxNodes = 16000;
+    private const int FutureBeamWidth = 12;
+    private const int FutureExpansions = 140;
     private static readonly Lazy<MethodInfo?> ReworkCheckMethod = new(() =>
         AppDomain.CurrentDomain.GetAssemblies()
             .FirstOrDefault(a => a.GetName().Name == "BetterDefect")?
@@ -104,7 +105,10 @@ internal static class TurnForecastPlanner
         BattleFactors? Factors = null, int SeriesPlayed = 0,
         Rng? CostRng = null, int MaxEnergy = 3, int HandDraw = 5,
         int FeralMax = 0, bool ReworkedLoop = false,
-        Rng? TargetRng = null);
+        Rng? TargetRng = null)
+    {
+        public Creature[] LiveEnemies { get; init; } = [];
+    }
 
     private sealed record Node(
         SimCard[] Hand, SimCard[] Draw, int DrawCursor, SimCard[] Discard,
@@ -117,22 +121,158 @@ internal static class TurnForecastPlanner
         int SeriesPlayed = 0, Rng? CostRng = null,
         int TurnIndex = 0, double PlayerHp = 0,
         int[]? ProjectedIncoming = null, int FeralMax = 0,
-        string FutureFirst = "", Rng? TargetRng = null);
+        string FutureFirst = "", Rng? TargetRng = null)
+    {
+        public PlanStep? Plan { get; init; }
+    }
+
+    private sealed record PlanStep(LocalMove Move, PlanStep? Previous, Node Expected);
+    private sealed record PlanCache(CombatState Combat, Player Player, int Turn,
+        Creature[] Enemies, PlanStep[] Steps, string Powers, string Relics)
+    {
+        public int Played { get; set; }
+    }
+    private static PlanCache? _cachedPlan;
 
     private readonly record struct SearchResult(LocalMove? Move, int Nodes, int Depth,
-        bool Exhaustive, string Forecast);
+        bool Exhaustive, string Forecast, PlanStep? Plan);
     private readonly record struct FutureResult(double Score, string Forecast);
 
     public static async Task<LocalMove?> ChooseAsync(
         CombatState combat, Player player, CancellationToken token)
     {
+        _cachedPlan = null;
+        Stopwatch elapsed = Stopwatch.StartNew();
         Snapshot? snapshot = Capture(combat, player);
         if (snapshot is null) return null;
+        long captureMs = elapsed.ElapsedMilliseconds;
         SearchResult result = await Task.Run(() => Search(snapshot, token), token);
+        PlanStep[] steps = Unwind(result.Plan);
+        if (steps.Length > 1 && player.PlayerCombatState is { } pcs)
+            _cachedPlan = new PlanCache(combat, player, pcs.TurnNumber,
+                snapshot.LiveEnemies, steps, PowerSignature(combat, player),
+                RelicSignature(player));
         MainFile.Log.Info($"[LocalAutoPlay] PLAN nodes={result.Nodes} depth={result.Depth} " +
+            $"captureMs={captureMs} totalMs={elapsed.ElapsedMilliseconds} " +
+            $"cachedSteps={steps.Length} " +
             $"exhaustive={result.Exhaustive} forecast={result.Forecast} " +
             $"first={result.Move?.Card.Id.Entry ?? "none"}");
         return result.Move;
+    }
+
+    public static bool TryUseCachedNext(CombatState combat, Player player,
+        int turn, out LocalMove? move)
+    {
+        move = null;
+        PlanCache? cache = _cachedPlan;
+        if (cache is null || !ReferenceEquals(cache.Combat, combat) ||
+            !ReferenceEquals(cache.Player, player) || cache.Turn != turn ||
+            cache.Played >= cache.Steps.Length)
+        { _cachedPlan = null; return false; }
+        PlanStep previous = cache.Steps[cache.Played];
+        bool matches;
+        try
+        {
+            matches = Matches(previous.Expected, combat, player, cache.Enemies) &&
+                PowerSignature(combat, player) == cache.Powers &&
+                RelicSignature(player) == cache.Relics;
+        }
+        catch (Exception ex)
+        {
+            MainFile.Log.Warn($"[LocalAutoPlay] CACHE_INVALIDATED validation failed: {ex}");
+            _cachedPlan = null;
+            return false;
+        }
+        if (!matches)
+        {
+            MainFile.Log.Info("[LocalAutoPlay] CACHE_INVALIDATED actual state differs from forecast");
+            _cachedPlan = null;
+            return false;
+        }
+        cache.Played++;
+        if (cache.Played >= cache.Steps.Length)
+        { _cachedPlan = null; return false; }
+        LocalMove next = cache.Steps[cache.Played].Move;
+        bool playable;
+        try
+        {
+            playable = player.PlayerCombatState!.Hand.Cards.Contains(next.Card) &&
+                next.Card.CanPlay() &&
+                (next.Target is null || next.Card.CanPlayTargeting(next.Target));
+        }
+        catch { playable = false; }
+        if (!playable)
+        { _cachedPlan = null; return false; }
+        move = next;
+        MainFile.Log.Info($"[LocalAutoPlay] CACHE_HIT step={cache.Played + 1}/{cache.Steps.Length} " +
+            $"card={next.Card.Id.Entry}");
+        return true;
+    }
+
+    public static void ClearCachedPlan() => _cachedPlan = null;
+
+    private static PlanStep[] Unwind(PlanStep? last)
+    {
+        List<PlanStep> steps = [];
+        for (PlanStep? step = last; step is not null; step = step.Previous)
+            steps.Add(step);
+        steps.Reverse();
+        return steps.ToArray();
+    }
+
+    private static string PowerSignature(CombatState combat, Player player) =>
+        string.Join('|', new[] { player.Creature }.Concat(combat.HittableEnemies)
+            .Select(c => string.Join(',', c.Powers
+                .Select(p => $"{p.Id}/{p.Amount}").OrderBy(s => s, StringComparer.Ordinal))));
+
+    private static string RelicSignature(Player player) =>
+        string.Join(',', player.Relics.Select(r => $"{r.Id}/{r.DisplayAmount}"));
+
+    private static bool Matches(Node expected, CombatState combat, Player player,
+        Creature[] enemies)
+    {
+        PlayerCombatState? pcs = player.PlayerCombatState;
+        if (pcs is null || pcs.Energy != expected.Energy ||
+            Math.Abs((double)player.Creature.CurrentHp - expected.PlayerHp) > 0.01 ||
+            Math.Abs((double)player.Creature.Block - expected.Block) > 0.01 ||
+            enemies.Length != expected.EnemyHp.Length ||
+            pcs.OrbQueue.Orbs.Count != expected.Orbs.Length ||
+            pcs.Hand.Cards.Count != expected.Hand.Length ||
+            pcs.DrawPile.Cards.Count != expected.Draw.Length - expected.DrawCursor ||
+            pcs.DiscardPile.Cards.Count != expected.Discard.Length)
+            return false;
+        for (int i = 0; i < enemies.Length; i++)
+            if (Math.Abs((double)(enemies[i].CurrentHp + enemies[i].Block) -
+                expected.EnemyHp[i]) > 0.01) return false;
+        for (int i = 0; i < expected.Orbs.Length; i++)
+        {
+            var orb = pcs.OrbQueue.Orbs[i];
+            SimOrb predicted = expected.Orbs[i];
+            if (orb.GetType().Name != predicted.Kind ||
+                Math.Abs((double)orb.PassiveVal - predicted.Passive) > 0.01 ||
+                Math.Abs((double)orb.EvokeVal - predicted.Evoke) > 0.01)
+                return false;
+        }
+        for (int i = 0; i < expected.Hand.Length; i++)
+        {
+            SimCard predicted = expected.Hand[i];
+            CardModel actual = pcs.Hand.Cards[i];
+            if (!ReferenceEquals(actual, predicted.Model) ||
+                actual.EnergyCost.GetAmountToSpend() != EffectiveCost(predicted, expected))
+                return false;
+            EnchantmentModel? enchant = actual.Enchantment;
+            if (predicted.Enchant is null)
+            {
+                if (enchant is not null) return false;
+            }
+            else if (enchant is null ||
+                enchant.GetType().Name != predicted.Enchant.Kind ||
+                enchant.Amount != predicted.Enchant.Amount ||
+                (enchant.Status == EnchantmentStatus.Normal) != predicted.Enchant.Active ||
+                actual.GetEnchantedReplayCount() != predicted.Enchant.ExtraReplays)
+                return false;
+        }
+        return true;
     }
 
     private static Snapshot? Capture(CombatState combat, Player player)
@@ -193,7 +333,7 @@ internal static class TurnForecastPlanner
             Math.Max(0, pcs.MaxEnergy), 5,
             player.Creature.Powers.Where(p => p.GetType().Name == "FeralPower")
                 .Sum(p => p.Amount), IsReworkedLoop(),
-            Fork(player.RunState.Rng.CombatTargets));
+            Fork(player.RunState.Rng.CombatTargets)) { LiveEnemies = enemies };
     }
 
     private static BattleFactors CaptureFactors(Player player, Creature[] enemies)
@@ -447,7 +587,8 @@ internal static class TurnForecastPlanner
                     int cost = EffectiveCost(card, node);
                     if (cost > node.Energy) continue;
                     foreach ((int targetIndex, Creature? target) in Targets(card,
-                        node.EnemyHp, node.TurnIndex == 0 && node.Depth == 0))
+                        node.EnemyHp, node.TurnIndex == 0 && node.Depth == 0,
+                        snapshot.LiveEnemies))
                     {
                         if ((expanded & 63) == 0)
                         {
@@ -495,7 +636,7 @@ internal static class TurnForecastPlanner
             double bestForecast = double.NegativeInfinity;
             foreach (Node candidate in boundary.Values.SelectMany(c => c)
                 .OrderByDescending(c => c.Score)
-                .Select(c => c.Node).DistinctBy(StateKey).Take(18))
+                .Select(c => c.Node).DistinctBy(StateKey).Take(14))
             {
                 if (watch.ElapsedMilliseconds >= TotalSearchMs) { cutoff = true; break; }
                 FutureResult forecast = ForecastThreeTurns(candidate, snapshot, watch, token);
@@ -507,7 +648,7 @@ internal static class TurnForecastPlanner
             }
         }
         return new SearchResult(best.First is { } first ? first with { Score = bestScore } : null,
-            expanded, deepest, !cutoff, bestTrace);
+            expanded, deepest, !cutoff, bestTrace, best.Plan);
     }
 
     private static FutureResult ForecastThreeTurns(Node firstTurn, Snapshot snapshot,
@@ -526,22 +667,22 @@ internal static class TurnForecastPlanner
             double secondScore = EvaluateEnd(second, snapshot);
             if (secondScore >= 10000 || secondScore <= -10000)
             {
-                double value = 0.4 * firstScore + 0.6 * secondScore;
+                double value = 0.55 * firstScore + 0.45 * FutureScore(secondScore);
                 if (value > best) { best = value; bestTrace = second.Forecast; }
                 continue;
             }
             Node? thirdStart = AdvanceTurn(second, snapshot);
             if (thirdStart is null)
             {
-                double value = 0.4 * firstScore + 0.6 * secondScore;
+                double value = 0.55 * firstScore + 0.45 * FutureScore(secondScore);
                 if (value > best) { best = value; bestTrace = second.Forecast; }
                 continue;
             }
             Node third = SearchFutureTurn(thirdStart, snapshot, watch, token)
                 .OrderByDescending(n => EvaluateEnd(n, snapshot)).First();
             double thirdScore = EvaluateEnd(third, snapshot);
-            double total = 0.25 * firstScore + 0.3 * secondScore +
-                0.45 * thirdScore;
+            double total = 0.55 * firstScore + 0.30 * FutureScore(secondScore) +
+                0.15 * FutureScore(thirdScore);
             if (total > best) { best = total; bestTrace = third.Forecast; }
             if (watch.ElapsedMilliseconds >= TotalSearchMs) break;
         }
@@ -549,6 +690,11 @@ internal static class TurnForecastPlanner
             ? new FutureResult(firstScore, firstTurn.Forecast)
             : new FutureResult(best, bestTrace);
     }
+
+    // Future intent and distant shuffles are estimates. A speculative kill must
+    // not receive the same 10,000-point certainty bonus as a kill this turn.
+    private static double FutureScore(double score) => score >= 10000
+        ? 150 + Math.Min(100, score - 10000) : score;
 
     private static IReadOnlyList<Node> SearchFutureTurn(Node start, Snapshot snapshot,
         Stopwatch watch, CancellationToken token)
@@ -569,7 +715,8 @@ internal static class TurnForecastPlanner
                     if (card.Type is CardType.Status or CardType.Curse ||
                         EffectiveCost(card, node) > node.Energy) continue;
                     foreach ((int targetIndex, Creature? target) in
-                        Targets(card, node.EnemyHp, firstAction: false))
+                        Targets(card, node.EnemyHp, firstAction: false,
+                            snapshot.LiveEnemies))
                     {
                         if ((expanded & 31) == 0)
                         {
@@ -744,11 +891,13 @@ internal static class TurnForecastPlanner
     }
 
     private static IEnumerable<(int Index, Creature? Target)> Targets(
-        SimCard card, double[] hp, bool firstAction)
+        SimCard card, double[] hp, bool firstAction, Creature[]? enemies = null)
     {
         if (firstAction) return card.RootTargets;
         if (card.TargetType == TargetType.AnyEnemy)
-            return Enumerable.Range(0, hp.Length).Where(i => hp[i] > 0).Select(i => (i, (Creature?)null));
+            return Enumerable.Range(0, hp.Length).Where(i => hp[i] > 0)
+                .Select(i => (i, enemies is not null && i < enemies.Length
+                    ? enemies[i] : (Creature?)null));
         if (card.TargetType == TargetType.AnyAlly) return [];
         return [(-1, null)];
     }
@@ -1374,9 +1523,10 @@ internal static class TurnForecastPlanner
             node.SeriesPlayed + (card.VirtualReplay ? 0 : 1), costRng,
             node.TurnIndex, node.PlayerHp, node.ProjectedIncoming,
             node.FeralMax + (card.Kind == "Feral" ? Math.Max(1, card.Amount) : 0),
-            node.FutureFirst.Length > 0 || node.TurnIndex == 0
-                ? node.FutureFirst : card.Id, targetRng);
-        if (replays == 0) return resolved;
+             node.FutureFirst.Length > 0 || node.TurnIndex == 0
+                 ? node.FutureFirst : card.Id, targetRng) { Plan = node.Plan };
+        if (replays == 0)
+            return RecordStep(resolved, node, card, target, selection);
         SimCard replay = playedCard with
         {
             VirtualReplay = true,
@@ -1424,7 +1574,17 @@ internal static class TurnForecastPlanner
                 Discard = resolved.Discard.Select(Replace).ToArray()
             };
         }
-        return resolved;
+        return RecordStep(resolved, node, card, target, selection);
+    }
+
+    private static Node RecordStep(Node result, Node previous, SimCard card,
+        Creature? target, IReadOnlyList<CardModel> selection)
+    {
+        if (previous.TurnIndex != 0 || card.VirtualReplay || card.Model is null)
+            return result;
+        LocalMove move = new(card.Model, target, 0,
+            selection.Count > 0 ? selection.ToArray() : null);
+        return result with { Plan = new PlanStep(move, previous.Plan, result) };
     }
 
     private static void DrawCards(int count, List<SimCard> hand,
@@ -1704,6 +1864,7 @@ internal static class TurnForecastPlanner
                 if (factors.Enemies[i].Vulnerable > initial.Enemies[i].Vulnerable) future += 2;
             }
         return dealt - totalLoss * 12 + future + Math.Min(30, block - incoming) * 0.01
+            + Math.Min(6, node.Energy) * 0.35
             - node.Depth * 0.15;
     }
 
