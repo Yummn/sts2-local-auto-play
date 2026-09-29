@@ -687,21 +687,16 @@ internal static class TurnForecastPlanner
                     // speculative intent. Subtract the best forecast in this
                     // SAME shortlist; otherwise all candidates hit the same
                     // positive clamp and the tie-break changes nothing.
-                    double topFuture = forecasts.Max(item => item.Future);
                     futureComparison = string.Join(',', forecasts.Select(item =>
                         $"{item.Node.First?.Card.Id.Entry ?? "END"}:{item.Future:0.0}"));
-                    var winner = forecasts.Select(item => new
-                    {
-                        item.Node,
-                        item.Trace,
-                        Adjustment = Math.Clamp((item.Future - topFuture) * 0.12,
-                            -MaxForecastAdjustment, 0),
-                        item.Immediate
-                    }).OrderByDescending(item => item.Immediate + item.Adjustment)
-                      .First();
+                    var choice = ForecastTieBreaker.Choose(
+                        forecasts.Select(item => item.Immediate).ToArray(),
+                        forecasts.Select(item => item.Future).ToArray(),
+                        weight: 0.12, cap: MaxForecastAdjustment);
+                    var winner = forecasts[choice.Index];
                     best = winner.Node;
-                    bestScore = winner.Immediate + winner.Adjustment;
-                    forecastAdjustment = winner.Adjustment;
+                    bestScore = choice.Score;
+                    forecastAdjustment = choice.Adjustment;
                     bestTrace = winner.Trace;
                 }
                 else { cutoff = true; futureComparison = "incomplete"; }
