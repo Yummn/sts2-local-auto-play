@@ -117,7 +117,7 @@ internal static class LocalPlanner
             string name = card.GetType().Name;
             bool orb = name is "Zap" or "BallLightning" or "ColdSnap" or "Glacier"
                 or "Dualcast" or "Barrage" or "MultiCast" or "Recursion"
-                or "Chaos" or "Rainbow" or "Tempest";
+                or "Chaos" or "Rainbow" or "Tempest" or "LightningRod";
             candidates.Add(new Candidate(card, target, cardIndex, enemyIndex,
                 Math.Max(0, card.EnergyCost.GetAmountToSpend()), card.EnergyCost.CostsX,
                 Math.Max(Amount(card, "Damage"), Amount(card, "OstyDamage"))

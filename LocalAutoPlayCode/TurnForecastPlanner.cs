@@ -105,7 +105,7 @@ internal static class TurnForecastPlanner
         BattleFactors? Factors = null, int SeriesPlayed = 0,
         Rng? CostRng = null, int MaxEnergy = 3, int HandDraw = 5,
         int FeralMax = 0, bool ReworkedLoop = false,
-        Rng? TargetRng = null)
+        Rng? TargetRng = null, int LightningRodTurns = 0)
     {
         public Creature[] LiveEnemies { get; init; } = [];
     }
@@ -121,7 +121,8 @@ internal static class TurnForecastPlanner
         int SeriesPlayed = 0, Rng? CostRng = null,
         int TurnIndex = 0, double PlayerHp = 0,
         int[]? ProjectedIncoming = null, int FeralMax = 0,
-        string FutureFirst = "", Rng? TargetRng = null)
+        string FutureFirst = "", Rng? TargetRng = null,
+        int LightningRodTurns = 0)
     {
         public PlanStep? Plan { get; init; }
     }
@@ -333,7 +334,9 @@ internal static class TurnForecastPlanner
             Math.Max(0, pcs.MaxEnergy), 5,
             player.Creature.Powers.Where(p => p.GetType().Name == "FeralPower")
                 .Sum(p => p.Amount), IsReworkedLoop(),
-            Fork(player.RunState.Rng.CombatTargets)) { LiveEnemies = enemies };
+            Fork(player.RunState.Rng.CombatTargets),
+            player.Creature.Powers.Where(p => p.GetType().Name == "LightningRodPower")
+                .Sum(p => p.Amount)) { LiveEnemies = enemies };
     }
 
     private static BattleFactors CaptureFactors(Player player, Creature[] enemies)
@@ -414,7 +417,7 @@ internal static class TurnForecastPlanner
             or "Dualcast" or "Barrage" or "MultiCast" or "Recursion"
             or "Chaos" or "Rainbow" or "Tempest" or "Fusion"
             or "MeteorStrike" or "Darkness" or "Chill" or "Glasswork"
-            or "Shatter" or "Quadcast";
+            or "Shatter" or "Quadcast" or "LightningRod";
         double repeat = Math.Clamp(Amount(card, "Repeat", 1), 1, 8);
         EnchantmentModel? enchantment = card.Enchantment;
         SimEnchant? enchant = enchantment is null ? null : new SimEnchant(
@@ -457,13 +460,14 @@ internal static class TurnForecastPlanner
                 or "DoubleEnergy" or "ColdSnap" or "FocusedStrike"
                 or "BdRecursion" or "Skim" or "Sunder" or "Stack"
                 or "AllForOne" or "HelixDrill" or "BdReinforcedBody"
-                or "MeteorStrike"
+                or "MeteorStrike" or "LightningRod"
                 ? IsBetterDefectRework(card) : false,
             Amount: (int)(name switch
             {
                 "Chaos" or "Capacitor" or "Quadcast" => Amount(card, "Repeat", 1),
                 "Feral" => Amount(card, "FeralPower", 1),
                 "Loop" => Amount(card, "Loop", 1),
+                "LightningRod" => Amount(card, "LightningRodPower", 1),
                 "BdHeatsinks" => Amount(card, "Draw", 1),
                 "Burst" => Amount(card, "Skills", 1),
                 "EchoForm" => Amount(card, "EchoForm", 1),
@@ -864,6 +868,16 @@ internal static class TurnForecastPlanner
             ref shuffle, ref costRng, ref forecast);
         energy = snapshot.MaxEnergy;
         block = 0;
+        int capacity = node.OrbCapacity;
+        // Lightning Rod channels at the start of each affected turn. Its
+        // rework also channels immediately when played (handled in Apply).
+        int lightningRodTurns = node.LightningRodTurns;
+        if (lightningRodTurns > 0)
+        {
+            Channel(orbs, ref capacity, "LightningOrb", node.Focus - node.TempFocus,
+                hp, ref block, ref energy, factors, targetRng);
+            lightningRodTurns--;
+        }
         for (int repeat = 0; repeat < node.Loop && orbs.Count > 0; repeat++)
         {
             TriggerPassive(orbs, 0, hp, ref block, ref energy, factors, targetRng);
@@ -882,11 +896,13 @@ internal static class TurnForecastPlanner
             Discard = discard.ToArray(), ShuffleRng = shuffle, CostRng = costRng,
             Energy = energy, CardsPlayedThisTurn = 0,
             SeriesPlayed = 0, Block = block, EnemyHp = hp,
-            Orbs = orbs.ToArray(), Focus = node.Focus - node.TempFocus,
+            Orbs = orbs.ToArray(), OrbCapacity = capacity,
+            Focus = node.Focus - node.TempFocus,
             TempFocus = 0, FeralUses = node.FeralMax,
             Factors = factors, PlayerHp = remainingHp,
             TurnIndex = node.TurnIndex + 1, ProjectedIncoming = nextIncoming,
-            Forecast = forecast, FutureFirst = "", TargetRng = targetRng
+            Forecast = forecast, FutureFirst = "", TargetRng = targetRng,
+            LightningRodTurns = lightningRodTurns
         };
     }
 
@@ -1112,6 +1128,10 @@ internal static class TurnForecastPlanner
             case "BdDoomAndGloom":
             case "ConsumingShadow":
                 Channel(orbs, ref capacity, "DarkOrb", focus, hp,
+                    ref block, ref energy, factors, targetRng);
+                break;
+            case "LightningRod" when card.Reworked:
+                Channel(orbs, ref capacity, "LightningOrb", focus, hp,
                     ref block, ref energy, factors, targetRng);
                 break;
             case "Chaos":
@@ -1524,7 +1544,10 @@ internal static class TurnForecastPlanner
             node.TurnIndex, node.PlayerHp, node.ProjectedIncoming,
             node.FeralMax + (card.Kind == "Feral" ? Math.Max(1, card.Amount) : 0),
              node.FutureFirst.Length > 0 || node.TurnIndex == 0
-                 ? node.FutureFirst : card.Id, targetRng) { Plan = node.Plan };
+                 ? node.FutureFirst : card.Id, targetRng,
+            node.LightningRodTurns + (card.Kind == "LightningRod"
+                ? card.Reworked ? 1 : Math.Max(1, card.Amount) : 0))
+            { Plan = node.Plan };
         if (replays == 0)
             return RecordStep(resolved, node, card, target, selection);
         SimCard replay = playedCard with
@@ -1849,6 +1872,7 @@ internal static class TurnForecastPlanner
         double future = node.OtherPowerValue
             + Math.Min(6, node.Heatsinks * 3)
             + Math.Min(5, node.FeralUses * 2)
+            + Math.Min(4, node.LightningRodTurns * 2)
             + (orbs.Count == 0 ? Math.Min(2, node.Loop) : 0);
         future += OrbReserveValue(node, snapshot, orbs, hp);
         future += Math.Max(0, node.Focus - node.TempFocus) * 2;
@@ -1863,8 +1887,10 @@ internal static class TurnForecastPlanner
                 if (factors.Enemies[i].Weak > initial.Enemies[i].Weak) future += 2;
                 if (factors.Enemies[i].Vulnerable > initial.Enemies[i].Vulnerable) future += 2;
             }
+        // Unspent energy vanishes at turn end. Rewarding it here made Turbo
+        // look beneficial with an empty hand and could reject a useful orb
+        // card in favour of ending the turn with four wasted energy.
         return dealt - totalLoss * 12 + future + Math.Min(30, block - incoming) * 0.01
-            + Math.Min(6, node.Energy) * 0.35
             - node.Depth * 0.15;
     }
 
@@ -1984,7 +2010,7 @@ internal static class TurnForecastPlanner
         // prefers the first (shorter) route, which also prevents frame spikes.
         return $"{node.TurnIndex}:{node.PlayerHp:0.0}:{node.Energy}:{node.Block:0.0}:{node.DrawCursor}:" +
             $"targetRng={RngCounter(node.TargetRng)}:" +
-            $"{node.CardsPlayedThisTurn}:{node.SeriesPlayed}:{node.OrbCapacity}:{node.OtherPowerValue:0.0}:" +
+            $"{node.CardsPlayedThisTurn}:{node.SeriesPlayed}:{node.OrbCapacity}:{node.OtherPowerValue:0.0}:{node.LightningRodTurns}:" +
             $"{string.Join(',', node.EnemyHp.Select(h => Math.Round(h)))}:" +
             $"{string.Join(',', node.Hand.Select(c =>
                 CardKey(c, EffectiveCost(c, node))).OrderBy(s => s))}:" +

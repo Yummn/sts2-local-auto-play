@@ -16,7 +16,7 @@ public static class MainFile
     public static void Initialize()
     {
         new Harmony("LocalAutoPlay").PatchAll();
-        Log.Info("[LocalAutoPlay] v0.5.8 loaded; bounded forecast and validated plan reuse, no potions.");
+        Log.Info("[LocalAutoPlay] v0.5.9 loaded; Lightning Rod and wasted-energy forecast corrected, no potions.");
     }
 }
 
