@@ -1,5 +1,35 @@
 # 局部自动出牌 v0.6.0
 
+<!-- MOD-DOWNLOAD-ZH-START -->
+## 中文下载与安装（先看这里）
+
+- **局部自动出牌**：请进入 [发布下载 / Releases](https://github.com/Yummn/sts2-local-auto-play/releases)，展开 **Assets**，选择对应平台和游戏版本的中文安装包。
+- **不要下载** Code → Download ZIP 或 Source code (zip/tar.gz)：那是源码，不含可直接安装的编译产物。
+- 手动上传的源码压缩包已撤下，今后只发布安装包、说明和验证资料；项目代码仍保留在仓库。
+
+### 本轮对应安装包
+
+- [手机 v0.113.0](https://github.com/Yummn/sts2-local-auto-play/releases/download/mobile-v113-pc-v111-20261117/LocalAutoPlay-0.6.1-Android-v113.0.zip)
+- [电脑 v0.111.0（尚未实机回归）](https://github.com/Yummn/sts2-local-auto-play/releases/download/mobile-v113-pc-v111-20261117/LocalAutoPlay-0.6.1-PC-v111.0.zip)
+
+以上只是本轮构建目标，其他游戏版本请查看相应历史发布；不能混装手机和电脑版。旧文档中的版本号、源码附件指引如与本节冲突，以本节及对应Release说明为准。
+
+### 电脑版安装
+
+1. 退出游戏，解压**电脑版安装包**。
+2. 将整个 `LocalAutoPlay` 文件夹放到游戏根目录的 `mods` 文件夹中；没有 `mods` 就新建。
+3. 重启游戏，在模组列表中启用。不要只把ZIP或源码目录放在游戏根目录。
+
+```text
+Slay the Spire 2/mods/LocalAutoPlay/LocalAutoPlay.dll
+Slay the Spire 2/mods/LocalAutoPlay/LocalAutoPlay.json
+```
+
+手机版请使用对应游戏版本的启动器导入安装包，不要拿电脑版代替；保留原有存档和模组配置。
+
+GitHub 自动生成的 Source code 链接不能单独删除，因此请认准上面的中文安装包链接。
+<!-- MOD-DOWNLOAD-ZH-END -->
+
 单人战斗中，左侧有两个操作：
 
 - **自动一回合**：参考当前及后续两个回合规划出牌，必要时提前结束回合；只执行当前回合，不会接管下一回合。
